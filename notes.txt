@@ -1,0 +1,11 @@
+Notes!
+
+Basic stuff:
+
+    There are 4 types of nodes: Client, Node, Streamer, Bootstraper. Node, Streamer and Bootstraper
+    are basically the same, we can even start a streamer as like python ./node.py --streamer (same for bootstraper).
+
+    The client explicitely requests streams, and never streams itself.
+
+    The Bootstraper should only be used at the beggining, to build the network. Any further comms with it afterwards
+    is strictly forbidden! 

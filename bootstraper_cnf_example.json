@@ -1,0 +1,25 @@
+{
+    "nodes": {
+        "node1": {
+            "address": "10.0.0.10",
+            "neighbours": [
+                "node2",
+                "node3"
+            ]
+        },
+        "node2": {
+            "address": "10.0.0.20",
+            "neighbours": [
+                "node1",
+                "node3"
+            ]
+        },
+        "node3": {
+            "address": "10.0.0.30",
+            "neighbours": [
+                "node1",
+                "node2"
+            ]
+        }
+    }
+}
