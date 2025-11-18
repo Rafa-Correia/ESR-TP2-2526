@@ -9,9 +9,23 @@ class Bootstrapper:
         with open(filepath, 'r') as file:
             self.data = json.load(file)['nodes']
     
-    def find(self, node_name):
+    def find(self, node_name, addr):
         if node_name in self.data.keys():
-            return self.data[node_name]['neighbours']
+            n_addresses = self.data[node_name]['addresses']
+            (ip, port) = addr
+            if ip not in n_addresses:
+                print(f"Node {node_name} doesn't have matching address {addr}.")
+                return -1
+            
+            n_dict = {}
+            neighbours = self.data[node_name]['neighbours']
+            if not neighbours:
+                return None #if no neighbours, don't return anything!
+            for neighbour in neighbours:
+                addresses = self.data[neighbour]['addresses']
+                n_dict[neighbour] = addresses
+            
+            return n_dict
         else:
             return None
         
@@ -46,15 +60,26 @@ def main(argc, argv):
                 if not data:
                     break #if data is non truthy then client has closed connection
                 
-                result = b.find(data.decode('ascii'))
-                if result:
-                    result = ' - '.join(result)
+                result = b.find(data.decode('ascii'), c_addr)
+                data_string = ''
+                if result == -1:
+                    data_string = '$'
+                elif result is not None:
+                    #transform dictionary into serializable string
+                    keys = result.keys()
+                    for i, neighbour in enumerate(keys):
+                        data_string += f'{neighbour}:'
+                        addresses = result[neighbour]
+                        address_string = ','.join(addresses)
+                        data_string += address_string
+                        if(i != len(keys) - 1):
+                            data_string += ';'
                 else:
-                    result = 'Not found'
+                    data_string = '%'
                 
-                print(f"Got request from {data.decode('ascii')} at addr {c_addr}. Result: {result}.")
+                print(f"Got request from {data.decode('ascii')} at addr {c_addr}. Result: {data_string}.")
                 
-                connection.sendall(result.encode('ascii'))
+                connection.sendall(data_string.encode('ascii'))
                 connection.close()
     except Exception as e:
         print(f"Error: {e}")

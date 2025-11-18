@@ -53,7 +53,7 @@ node n4 {
     type router
     model router
     network-config {
-	hostname n4
+	hostname node4
 	!
 	interface eth1
 	 ip address 10.0.5.1/24
@@ -75,7 +75,7 @@ node n5 {
     type router
     model router
     network-config {
-	hostname n5
+	hostname node3
 	!
 	interface eth1
 	 ip address 10.0.7.2/24
@@ -102,7 +102,7 @@ node n6 {
     type router
     model router
     network-config {
-	hostname n6
+	hostname node2
 	!
 	interface eth0
 	 ip address 10.0.0.1/24
@@ -124,7 +124,7 @@ node n7 {
     type router
     model router
     network-config {
-	hostname n7
+	hostname node1
 	!
 	interface eth0
 	 ip address 10.0.1.1/24
@@ -179,7 +179,7 @@ canvas c1 {
 option global {
     interface_names no
     ip_addresses yes
-    ipv6_addresses yes
+    ipv6_addresses no
     node_labels yes
     link_labels yes
     show_api no
