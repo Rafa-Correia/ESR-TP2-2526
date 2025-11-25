@@ -3,7 +3,7 @@
 import socket
 
 addr = "10.0.5.10"
-port = 1234
+port = 4321
 
 name = input("Node's name: ")
 

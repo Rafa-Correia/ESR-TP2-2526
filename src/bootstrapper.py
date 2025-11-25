@@ -38,7 +38,7 @@ def main(argc, argv):
     b = Bootstrapper(argv[1])
 
     address = ''
-    port = 1234
+    port = 4321
     
     ssocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     ssocket.bind((address, port))
