@@ -22,7 +22,8 @@
             "addresses": [
                 "10.0.2.2",
                 "10.0.7.2",
-                "10.0.4.1"
+                "10.0.4.1",
+                "10.0.3.1"
             ],
             "neighbours": [
                 "node1",
@@ -36,7 +37,16 @@
                 "10.0.5.1"
             ],
             "neighbours": [
-                "node3"
+                "node3",
+                "server"
+            ]
+        },
+        "server": {
+            "addresses": [
+                "10.0.5.10"
+            ],
+            "neighbours": [
+                "node4"
             ]
         }
     }

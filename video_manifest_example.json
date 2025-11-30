@@ -1,0 +1,12 @@
+{
+    "streams": {
+        "vid1": {
+            "location": "file/path/vid1.mp4",
+            "metadata": "something something"
+        },
+        "vid2": {
+            "location": "file/path/vid2.mp4",
+            "metadata": "something else ... "
+        }
+    }
+}
