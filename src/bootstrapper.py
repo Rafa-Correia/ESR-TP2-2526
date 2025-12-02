@@ -17,15 +17,11 @@ class Bootstrapper:
                 print(f"Node {node_name} doesn't have matching address {addr}.")
                 return -1
             
-            n_dict = {}
             neighbours = self.data[node_name]['neighbours']
             if not neighbours:
                 return None #if no neighbours, don't return anything!
-            for neighbour in neighbours:
-                addresses = self.data[neighbour]['addresses']
-                n_dict[neighbour] = addresses
             
-            return n_dict
+            return neighbours
         else:
             return None
         
@@ -64,18 +60,19 @@ def main(argc, argv):
                 data_string = ''
                 if result == -1:
                     data_string = '$'
-                elif result is not None:
+                elif result is None:
+                    data_string = "%"
+                    
+                else:
                     #transform dictionary into serializable string
                     keys = result.keys()
                     for i, neighbour in enumerate(keys):
                         data_string += f'{neighbour}:'
-                        addresses = result[neighbour]
-                        address_string = ','.join(addresses)
-                        data_string += address_string
+                        address = result[neighbour]
+                        data_string += address
                         if(i != len(keys) - 1):
                             data_string += ';'
-                else:
-                    data_string = '%'
+
                 
                 print(f"Got request from {data.decode('ascii')} at addr {c_addr}. Result: {data_string}.")
                 

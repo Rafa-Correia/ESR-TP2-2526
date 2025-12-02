@@ -1,0 +1,79 @@
+{
+    "nodes": {
+        "node1": {
+            "addresses": [
+                "10.0.1.1",
+                "10.0.7.1",
+                "10.0.6.1"
+            ],
+            "neighbours": {
+                "node3": "10.0.7.2",
+                "server2": "10.0.6.10"
+            }
+        },
+        "node2": {
+            "addresses": [
+                "10.0.0.1",
+                "10.0.2.1"
+            ],
+            "neighbours": {
+                "node3": "10.0.2.2"
+            }
+        },
+        "node3": {
+            "addresses": [
+                "10.0.2.2",
+                "10.0.7.2",
+                "10.0.4.1",
+                "10.0.3.1"
+            ],
+            "neighbours": {
+                "node1": "10.0.7.1",
+                "node2": "10.0.2.1",
+                "node4": "10.0.4.2"
+            }
+        },
+        "node4": {
+            "addresses": [
+                "10.0.4.2",
+                "10.0.5.1"
+            ],
+            "neighbours": {
+                "node3": "10.0.4.1",
+                "server": "10.0.5.10"
+            }
+        },
+        "server1": {
+            "addresses": [
+                "10.0.5.10"
+            ],
+            "neighbours": {
+                "node4": "10.0.5.1"
+            }
+        },
+        "server2": {
+            "addresses": [
+                "10.0.6.10"
+            ],
+            "neighbours": {
+                "node1": "10.0.6.1"
+            }
+        },
+        "client1": {
+            "addresses": [
+                "10.0.1.20"
+            ],
+            "neighbours": {
+                "node1": "10.0.1.1"
+            }
+        },
+        "client2": {
+            "addresses": [
+                "10.0.0.20"
+            ],
+            "neighbours": {
+                "node2": "10.0.0.1"
+            }
+        }
+    }
+}

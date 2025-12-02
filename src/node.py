@@ -11,7 +11,7 @@ TCP_PORT = 1234 #can be anything we want!
 UDP_PORT_START = 5000 #can be anything we want!
 UDP_PORT = UDP_PORT_START
 
-BOOTSTRAP_ADDR = '10.0.3.10' # placeholder, should always be passed as argument
+BOOTSTRAP_ADDR = '10.0.17.10' # placeholder, should always be passed as argument
 BOOTSTRAP_PORT = 4321 #can be anything
 
 HEARTBEAT_INTERVAL = 5
@@ -54,12 +54,12 @@ class Node:
         self.host = host
 
         self.bootstrap_addr = bootstrap_addr
-        self.peer_addresses = {} #node id -> [node addresses (str)]
+        self.peer_addresses = {} #node id -> node address
         
         self.peers = {} # str (node_id) -> (Reader, Writer)    |< this is the structure given by asyncio!
         self.peers_udp = {} # probably the same as above
         
-        self.streams = {} # str (stream_id) -> (provider , consumers, metrics, <video_info>)
+        self.streams = {} # str (stream_id) -> {provider , consumers, metrics, <video_info>)+}
                                             #   node_id   [node_id]   [smth]    stuff
 
         self.latest_heartbeat = {} # str (node_id) -> float? (last time heartbeat was received)
@@ -93,9 +93,8 @@ class Node:
         for na_str in node_addr_str:
             lb = na_str.split(':')
             node = lb[0]
-            addresses_str = lb[1]
-            addresses = addresses_str.split(',')
-            neigh_addr_dict[node] = addresses
+            address = lb[1]
+            neigh_addr_dict[node] = address
 
         if not neigh_addr_dict:
             return 3
@@ -117,41 +116,45 @@ class Node:
 
     async def check_heartbeats(self):
         while True:
-            await asyncio.sleep(2) #arbitrary, choose another good value later maybe
+            await asyncio.sleep(10) #arbitrary, choose another good value later maybe
             now = time.time()
             for peer_id, last in self.latest_heartbeat.items():
                 if now - last > HEARTBEAT_TIMEOUT:
                     self.handle_death(peer_id)
                     
-            #print(self.streams)
-            #if self.is_server:
-            #    print(self.own_streams)
+            print(self.streams)
+            if self.is_server:
+                print(self.own_streams)
 
 
     async def connect_to_peers(self):
-        for peer_id, paddress_list in self.peer_addresses.items():
+        for peer_id, peer_address in self.peer_addresses.items():
             if peer_id in self.peers.keys():
                 continue #peer was registered already (maybe he sent the connection just as we started)
             
-            for address in paddress_list:
-                try:
-                    reader, writer = await asyncio.open_connection(address, TCP_PORT)
-                    
-                    writer.write(MSG_HANDSHAKE.encode('ASCII') + self.name.encode('ASCII') + b'\n')
-                    await writer.drain()
-
-                    data = await reader.readline()
-                    msg = data.decode('ASCII').strip(' \n')
-
-                    if msg[0] != ANS_HANDSHAKE:
-                        print("Response to handshake wasn't ANS.")
-                        break
-
-                    self.peers[peer_id] = (reader, writer)
-                    self.latest_heartbeat[peer_id] = time.time()
-                    break
-                except:
+            try:
+                print(f"Attempting to connect to peer {peer_id}...", end="")
+                
+                reader, writer = await asyncio.open_connection(peer_address, TCP_PORT)
+                
+                writer.write(MSG_HANDSHAKE.encode('ASCII') + self.name.encode('ASCII') + b'\n')
+                await writer.drain()
+                
+                data = await reader.readline()
+                msg = data.decode('ASCII').strip(' \n')
+                
+                if msg[0] != ANS_HANDSHAKE:
+                    print("Response to handshake wasn't ANS.")
                     continue
+                
+                #register peer
+                self.peers[peer_id] = (reader, writer)
+                self.latest_heartbeat[peer_id] = time.time()
+            except:
+                print(" failed!")
+                continue
+
+            print(" success!")
 
             if peer_id in self.peers.keys():
                 #if connection successfuly established
@@ -199,14 +202,19 @@ class Node:
             msg_split = msg.split(';')
             stream_id = msg_split[0]
             n_jumps_incoming = int(msg_split[1]) + 1
+            
             #print(f"Flood received from {peer_id} for stream {stream_id}.")
             if stream_id in self.streams.keys():
-                n_jumps_stored, provider, consumers = self.streams[stream_id]
-                if n_jumps_incoming < n_jumps_stored and peer_id not in consumers: #dont accept flood from consumer
-                    self.streams[stream_id] = (n_jumps_incoming, peer_id, consumers)
+                stream_info = self.streams[stream_id]
+                n_jumps_stored = stream_info["n_jumps"]
+                if n_jumps_incoming < n_jumps_stored:
+                    stream_info["n_jumps"]  = n_jumps_incoming
+                    self.streams[stream_id] = stream_info
                     await self.flood(stream_id)
+            
             else:
-                self.streams[stream_id] = (n_jumps_incoming, peer_id, set())
+                stream_info = {"n_jumps": n_jumps_incoming, "provider": peer_id, "consumers": set()}
+                self.streams[stream_id] = stream_info
                 await self.flood(stream_id)
             
             
@@ -218,10 +226,15 @@ class Node:
     async def flood(self, stream_id, is_own=False):
         
         if is_own:
-            n_jumps_stored, provider, consumers, _ = self.own_streams[stream_id]
-            #      0,         None,     set()
+            stream_info = self.own_streams[stream_id]
+            n_jumps_stored = 0
+            provider = None
+            consumers = stream_info["consumers"]
         else:  
-            n_jumps_stored, provider, consumers = self.streams[stream_id]
+            stream_info = self.streams[stream_id]
+            n_jumps_stored = stream_info["n_jumps"]
+            provider = stream_info["provider"]
+            consumers = stream_info["consumers"]
         
         #who to send it to? 
         #anyone but their provider (or backup provider, if exists) and already existing consumers?
@@ -229,10 +242,10 @@ class Node:
             if peer_id == provider: #also check if in backup provider later!
                 continue
             
-            print(peer_id)
-            
             consumers.add(peer_id)
-            self.streams[stream_id] = (n_jumps_stored, provider, consumers)
+            
+            stream_info["consumers"] = consumers
+            self.streams[stream_id] = stream_info
             
             msg_str = FLOOD_STREAM + stream_id + ';' +  str(n_jumps_stored) + '\n'
             msg = msg_str.encode('ASCII')
@@ -242,17 +255,17 @@ class Node:
             
                  
     async def flood_all(self):
-        if self.streams:
-            print("Called flood_all, not empty")
-        else:
-            print("Called flood_all, empty")
+        #if self.streams:
+        #    print("Called flood_all, not empty")
+        #else:
+        #    print("Called flood_all, empty")
 
         
-        for stream_id, _ in self.streams.items():
+        for stream_id in self.streams.keys():
             await self.flood(stream_id)
             
         if self.is_server:
-            for stream_id, _ in self.own_streams.items():
+            for stream_id in self.own_streams.keys():
                 await self.flood(stream_id, is_own=True)
 
 
@@ -290,6 +303,16 @@ class Node:
         if peer:
             _, writer = peer
             writer.close()
+            
+            #remove all streams it provides
+            for stream_id, stream_info in self.streams.items():
+                if peer_id == stream_info["provider"]:
+                    self.streams.pop(stream_id) 
+                    # Note:
+                    #
+                    # this should trigger either getting the backup going
+                    # or connecting to the parent provider.
+            
             print(f"Closed connection with {peer_id}.")
 
 
@@ -305,7 +328,8 @@ class Node:
                 return 2
             
             for stream_id in data.keys():
-                self.own_streams[stream_id] = (0, None, set(), data[stream_id])
+                stream_info = {"n_jumps": 0, "provider": None, "consumers": set(), "metadata": data[stream_id]}
+                self.own_streams[stream_id] = stream_info
         except Exception as e:
             print(e)
             return 2

@@ -2,7 +2,7 @@ node n1 {
     type router
     model host
     network-config {
-	hostname Servidor
+	hostname server
 	!
 	interface eth0
 	 ip address 10.0.5.10/24
@@ -19,7 +19,7 @@ node n2 {
     type router
     model PC
     network-config {
-	hostname Cliente1
+	hostname client2
 	!
 	interface eth0
 	 ip address 10.0.0.20/24
@@ -36,7 +36,7 @@ node n3 {
     type router
     model PC
     network-config {
-	hostname Cliente2
+	hostname client1
 	!
 	interface eth0
 	 ip address 10.0.1.20/24
@@ -151,7 +151,7 @@ node n8 {
     type router
     model host
     network-config {
-	hostname Bootstrapper
+	hostname bootstrapper
 	!
 	interface eth0
 	 ip address 10.0.3.10/24
