@@ -225,7 +225,7 @@ class Node:
         msg_type = message[0]
         msg = message[1:]
         
-        print(f"[{peer_id}]: {msg_type} , {msg}")
+        #print(f"[{peer_id}]: {msg_type} , {msg}")
         if msg_type == MSG_HEARTBEAT:
             self.latest_heartbeat[peer_id] = time.time()
             #print(f"Heartbeat received from {peer_id}.")
@@ -260,33 +260,66 @@ class Node:
                         "consumers": set(),
                     }
                     altered_streams.append(stream_id)
+                    
+                    #since stream did not exist, request parent provider
+                    await self.request_parent(stream_id, peer_id)
                 else:
+                    #stream already existed
+                    
                     if n_jumps < self.streams[stream_id]["n_jumps"]:
+                        old_stream = self.streams[stream_id]
+                        
                         self.streams[stream_id]["n_jumps"] = n_jumps
                         self.streams[stream_id]["provider"] = peer_id
                         altered_streams.append(stream_id)
-                    else:
+                    
                         backup = self.stream_backups.get(stream_id, None)
-
-                        if backup is None:
-                            await self.request_parent(stream_id, peer_id)
+                        if not backup: #if no backups, just make sure its a dict (instead of None)
+                            self.stream_backups[stream_id] = {}
+                        if len(self.stream_backups[stream_id]) == 1:
+                            (provider, backup_info), = self.stream_backups[stream_id].items()
+                            if backup_info['parent']: #this is a boolean that identifies if backup is 'parent request' type
+                                self.stream_backups[stream_id].pop(provider)
                         
-                        elif len(backup) == 1:
-                            (provider, backup_info), = backup.items()
-                            if backup_info['parent']:
-                                backup.pop(provider)
+                        self.stream_backups[stream_id][old_stream['provider']] = {
+                            "provider_ip": "0.0.0.0",
+                            "parent": False,
+                            "metrics": old_stream['n_jumps']
+                        }
                         
-                            self.stream_backups[stream_id][peer_id] = {
-                                "n_jumps": n_jumps,
-                                "provider_ip": None,
-                                "parent": False
-                            }
-                        else:
-                            self.stream_backups[stream_id][peer_id] = {
-                                "n_jumps": n_jumps,
-                                "provider_ip": None,
-                                "parent": False
-                            }
+                    else:
+                        #no switching done, straight to backup
+                        
+                        #now, we should always have at least one backup
+                        #that being the parent provider of the first
+                        #provider.
+                        
+                        #but, just to be safe, we should definitelly check for that
+                        
+                        backup = self.stream_backups.get(stream_id, None)
+                        
+                        if not backup: #if no backups, just make sure its a dict (instead of None)
+                            self.stream_backups[stream_id] = {}
+                            
+                        #now, if there are 0 backups, the new message will become the backup
+                        #if there are 2 or more backups, we are SURE that no backup is a 'parent request' backup
+                        #if there is just 1 backup, we need to check if it is a 'parent request' backup and
+                        #delete it
+                        
+                        if len(self.stream_backups[stream_id]) == 1:
+                            (provider, backup_info), = self.stream_backups[stream_id].items()
+                            if backup_info['parent']: #this is a boolean that identifies if backup is 'parent request' type
+                                self.stream_backups[stream_id].pop(provider)
+                                
+                        
+                        #now, after we confirmed that no remaining backups are 'parent requests'
+                        #we just need to insert new stream provision into backups!
+                        
+                        self.stream_backups[stream_id][peer_id] = {
+                            "provider_ip": "0.0.0.0",
+                            "parent": False,
+                            "metrics": n_jumps
+                        }
                         
             #flood
             await self.flood(altered_streams)
@@ -295,8 +328,14 @@ class Node:
             stream_id = msg
             print(f'Parent requested from {peer_id} for {stream_id}.')
 
+            if self.is_server:
+                #TODO: tell parent provider is self in case of is_server
+                print("TODO")
+
             if stream_id in self.streams.keys():
                 #it exists!
+                #note, since the stream is being provided, the parent provider is
+                # GUARANTEED to be a peer. 
                 info = self.streams[stream_id]
                 provider = info["provider"]
                 provider_address = self.peer_addresses[provider]
@@ -310,6 +349,7 @@ class Node:
 
         elif msg_type == ANS_PARENT:
             fields = msg.split(';')
+            
             stream_id = fields[0]
             parent_name = fields[1]
             parent_address = fields[2]
@@ -317,8 +357,23 @@ class Node:
             if stream_id in self.parent_requests:
                 self.parent_requests.pop(self.parent_requests.index(stream_id))
 
-                if not self.stream_backups[stream_id]:
+                backups = self.stream_backups.get(stream_id, None)
+                
+                if not backups:
                     self.stream_backups[stream_id] = {}
+                    self.stream_backups[stream_id][parent_name] = {
+                                    "provider_ip": parent_address,
+                                    "parent": True
+                    }
+                    
+                # check if backup is parent.
+                # if so, replace
+                
+                elif len(backups) == 1:
+                    (provider, info), = backups.items()
+                    if info['parent']:
+                        self.stream_backups[stream_id].pop(provider)
+                        
                     self.stream_backups[stream_id][parent_name] = {
                                     "provider_ip": parent_address,
                                     "parent": True
@@ -328,6 +383,8 @@ class Node:
                 print(f"Request for parent of {stream_id} was either already satisfied or never existed.")    
 
         elif msg_type == UNPROVIDE_STREAM:
+            #TODO: finish this !
+            
             stream_list = msg.split(';')
 
             #step 1, gather all streams peer provides and backups with matching IDS
@@ -446,7 +503,7 @@ class Node:
 
             peer_id = handshake[1:]
 
-            print(f'Received handshake from {peer_id}.')
+            #print(f'Received handshake from {peer_id}.')
 
             self.peers[peer_id] = (reader, writer)
             self.latest_heartbeat[peer_id] = time.time()
@@ -490,9 +547,9 @@ class Node:
 
                     provider = self.streams[stream_id]["provider"]
                     if provider == peer_id:
-                        await self.request_parent(peer_id=peer_id, peer=peer)
+                        await self.request_parent(stream_id, peer_id=peer_id, peer=peer)
                     else:
-                        await self.request_parent(provider)
+                        await self.request_parent(stream_id, provider)
 
 
                 #choose best backup provider
@@ -525,6 +582,11 @@ class Node:
             
 
             print(f"Closed connection with {peer_id}.")
+
+
+    async def catastrophy(self, peer_id):
+        print(f'Peer {peer_id} has died without notifying.')
+        #TODO: handle sudden death 
 
 
     def load_manifest(self):
@@ -647,3 +709,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    
+    
+#START SCRIPT
+
+"""
+
+su - core \
+cd ESR-TP2-2526 \
+python3 src/node.py node1
+
+"""
