@@ -42,6 +42,7 @@ ANS_PARENT = 'R'               #  ans. parent provider:    [R][STREAM_ID][PARENT
 REQ_STREAM = 'S'               #      request a stream:    [S][STREAM_ID][\n]
 ANS_STREAM = 'A'               #      provide a stream:    [A][STREAM_ID][\n] # we should be opening a UDP connection after receiving this message
 UNREQ_STREAM = 'U'             #  'unrequest' a stream:    [U][STREAM_ID][\n] # basically, tell the receiving node that the stream will no longer be consumed
+UNPROVIDE_STREAM = 'N'         #   notify stop provide:    [N][stream_1][stream_2*]...[stream_n*][\n]               *optional
 
 MSG_METRIC = 'M'               #    req metric measure:    [M][METRIC_TYPE][ ... idk yet ... ][\n]
 # metric types
@@ -71,9 +72,10 @@ class Node:
                                         #                     [str]       [[str]]   [smth]    stuff
         self.stream_backups = {}        # stream_id [str] -> {provider -> provider_ip, parent, metrics, <video_info>} <- provider ip will only be used to establish emergency connection to parent provider
                                         #                      [str]        [str]     [bool]   [smth]    stuff
-        self.seen_floods = set()
 
         self.latest_heartbeat = {} # str (node_id) -> float? (last time heartbeat was received)
+
+        self.parent_requests = [] # list of streams which parents are currently requested
 
         self.tcp_server = None
         self.udp_server = None
@@ -223,7 +225,7 @@ class Node:
         msg_type = message[0]
         msg = message[1:]
         
-        #print(f"{msg_type} , {msg}"
+        print(f"[{peer_id}]: {msg_type} , {msg}")
         if msg_type == MSG_HEARTBEAT:
             self.latest_heartbeat[peer_id] = time.time()
             #print(f"Heartbeat received from {peer_id}.")
@@ -267,25 +269,32 @@ class Node:
                         backup = self.stream_backups.get(stream_id, None)
 
                         if backup is None:
-                            self.stream_backups[stream_id] = {}
-                            backup = self.stream_backups[stream_id]
+                            await self.request_parent(stream_id, peer_id)
                         
-                        if len(backup) == 1:
+                        elif len(backup) == 1:
                             (provider, backup_info), = backup.items()
                             if backup_info['parent']:
                                 backup.pop(provider)
                         
-                        self.stream_backups[stream_id][peer_id] = {
-                            "n_jumps": n_jumps,
-                            "provider_ip": None,
-                            "parent": False
-                        }
+                            self.stream_backups[stream_id][peer_id] = {
+                                "n_jumps": n_jumps,
+                                "provider_ip": None,
+                                "parent": False
+                            }
+                        else:
+                            self.stream_backups[stream_id][peer_id] = {
+                                "n_jumps": n_jumps,
+                                "provider_ip": None,
+                                "parent": False
+                            }
                         
             #flood
             await self.flood(altered_streams)
         
         elif msg_type == REQ_PARENT:
             stream_id = msg
+            print(f'Parent requested from {peer_id} for {stream_id}.')
+
             if stream_id in self.streams.keys():
                 #it exists!
                 info = self.streams[stream_id]
@@ -299,10 +308,41 @@ class Node:
                 writer.write(f'{MSG_ERROR}Provided stream_id is not known.\n'.encode('ASCII'))
                 await writer.drain()
 
+        elif msg_type == ANS_PARENT:
+            fields = msg.split(';')
+            stream_id = fields[0]
+            parent_name = fields[1]
+            parent_address = fields[2]
+
+            if stream_id in self.parent_requests:
+                self.parent_requests.pop(self.parent_requests.index(stream_id))
+
+                if not self.stream_backups[stream_id]:
+                    self.stream_backups[stream_id] = {}
+                    self.stream_backups[stream_id][parent_name] = {
+                                    "provider_ip": parent_address,
+                                    "parent": True
+                    }
+
+            else:
+                print(f"Request for parent of {stream_id} was either already satisfied or never existed.")    
+
+        elif msg_type == UNPROVIDE_STREAM:
+            stream_list = msg.split(';')
+
+            #step 1, gather all streams peer provides and backups with matching IDS
+
+            #step 2, remove backups provided by peer and remove provided streams and switch to backups
+
+            #step 3, notify changes (if stream provider changed!)
+
         elif msg_type == MSG_SHUTDOWN:
             print(f'Shutdown from {peer_id}!')
 
             await self.handle_death(peer_id)
+
+        elif msg_type == MSG_ERROR:
+            print(f"Error received from {peer_id}: {msg}")
 
         else:
             print(f"Unknown message type {msg_type} from {peer_id}.")
@@ -377,41 +417,18 @@ class Node:
 
     async def request_parent(self, stream_id, peer_id, peer = None):
         if peer:
-            reader, writer = peer
+            _, writer = peer
         else:
-            reader, writer = self.peers[peer_id]
+            _, writer = self.peers[peer_id]
 
         msg_str = f'{REQ_PARENT}{stream_id}\n'
         msg = msg_str.encode('ASCII')
 
-        writer.write(msg)
-        await writer.drain()
+        if stream_id not in self.parent_requests:
+            self.parent_requests.append(stream_id)
 
-        msg = await reader.readline()
-        msg_str = msg.decode('ASCII').strip(' \n')
-
-        msg_type = msg_str[0]
-        msg_content = msg_str[1:]
-
-        if msg_type == ANS_PARENT:
-            fields = msg_content.split(';')
-            sid = fields[0]
-            parent_name = fields[1]
-            parent_address = fields[2]
-
-            if sid != stream_id:
-                print(f'Received parent for another stream... UNHANDLED')
-                return 3
-        
-            return (parent_name, parent_address)
-
-        elif msg_type == MSG_ERROR:
-            print(f'Error received from {peer_id}: {msg_content}.')
-            return 1
-        
-        else:
-            print(f'Unexpected message {msg_type} from {peer_id}.')
-            return 2
+            writer.write(msg)
+            await writer.drain()
 
 
     async def handle_connection(self, reader, writer):
@@ -440,6 +457,7 @@ class Node:
             self._async_tasks.append(asyncio.create_task(self.listen_to_peer(peer_id)))
 
 
+    #this version handles death when peer sends a shutdown signal
     async def handle_death(self, peer_id):
         peer = self.peers.pop(peer_id, None)
         self.latest_heartbeat.pop(peer_id, None)
@@ -465,19 +483,17 @@ class Node:
             # 3rd, new provider for stream is now backup node.
             for stream_id in streams:
                 backup = self.stream_backups.get(stream_id, None)
+
+                #now, this shouldnt really happen. by this point AT LEAST 1 backup should be in place.
                 if not backup:
                     self.stream_backups[stream_id] = {}
 
                     provider = self.streams[stream_id]["provider"]
                     if provider == peer_id:
-                        parent_name, parent_address = self.request_parent(peer_id=peer_id, peer=peer)
+                        await self.request_parent(peer_id=peer_id, peer=peer)
                     else:
-                        parent_name, parent_address = self.request_parent(provider)
+                        await self.request_parent(provider)
 
-                    self.stream_backups[stream_id][parent_name] = {
-                        "provider_ip" : parent_address,
-                        "parent" : True
-                    }
 
                 #choose best backup provider
                 best_heuristic = 1000000 #for now use n_jumps
@@ -498,14 +514,9 @@ class Node:
 
                     provider = self.streams[stream_id]["provider"]
                     if provider == peer_id:
-                        parent_name, parent_address = self.request_parent(peer_id=peer_id, peer=peer)
+                        await self.request_parent(peer_id=peer_id, peer=peer)
                     else:
-                        parent_name, parent_address = self.request_parent(provider)
-
-                    self.stream_backups[stream_id][parent_name] = {
-                        "provider_ip" : parent_address,
-                        "parent" : True
-                    }
+                        await self.request_parent(provider)
 
             #step 4 - trigger flood for altered streams
 
@@ -599,7 +610,7 @@ class Node:
                 elif msg_type == MSG_FIN:
                     break
                 else:
-                    writer.write(f"{MSG_SHUTDOWN}\n".encode('ASCII'))
+                    writer.write(f"{MSG_ERROR}SHUTDOWN ALREADY SENT! NO LONGER ACCEPTING MESSAGES.\n".encode('ASCII'))
                     await writer.drain()
 
         if self.server is not None:
