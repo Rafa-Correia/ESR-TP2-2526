@@ -5,6 +5,7 @@ import sys
 import socket
 import argparse
 import json
+import functools
 
 # Global vars 
 DEFAULT_HOST = '0.0.0.0' #localhost
@@ -68,10 +69,40 @@ class Node:
         self.peers = {} # str (node_id) -> (Reader, Writer)    |< this is the structure given by asyncio!
         self.peers_udp = {} # probably the same as above
         
-        self.streams = {}               # stream_id [str] -> {provider , consumers, metrics, <video_info>} <- still unclear what stream metadata we need
-                                        #                     [str]       [[str]]   [smth]    stuff
-        self.stream_backups = {}        # stream_id [str] -> {provider -> provider_ip, parent, metrics, <video_info>} <- provider ip will only be used to establish emergency connection to parent provider
-                                        #                      [str]        [str]     [bool]   [smth]    stuff
+        self.streams = {}               
+        # dict
+        # has 'best' field, keeping track of best provider and it's metrics
+        # has 'backup' field, keeping track of all available backup providers
+        # it maps 'stream_id' to this pair.
+
+        # best field has following stucture:
+        # {
+        #   'provider' : str        # id of stream provider
+        #   'consumers': set()      # keeps track of active consumers (maybe its unnecessary?)
+        #   'root': bool            # if provider is root, it means no backup provider exists, so we need to handle this case carefully
+        #   'heuristic': float      # heuristic used to choose best provider. for now it's just n_jumps
+        #   <METRICS>  : TYPE       # undefined as is for now, maybe have latency, loss, bandwidth, etc
+        #                           # these metrics SHALL BE only the cummulative of previous jumps
+        #                           # peer connection metrics will only be tacked on if calculating heuristic or 
+        #                           # sending it forth!
+        #
+        #   'metadata': str         # still dont really know what to put here. perhaps video bitrate??? maybe its unnecessary
+        # } 
+
+        # backup field has following structure:
+        # {
+        #   provider_id1 [str] : {
+        #        'parent' : bool    # if backup provider is actually peer or requested parent provider (emergency backup)
+        #        'parent_ip': str   # address of parent provider (only used when 'parent' is True)
+        #        'heuristic': float # heuristic of backup connection (only present when 'parent' is False)
+        #        <METRICS> : TYPE   # list of accumulated metrics without peer metrics (only present when 'parent' is False)
+        #                           #'metadata': str    # maybe this is pointless, since metadata should be static
+        #   },
+        #   ...
+        #   provider_idn [str]: {
+        #        ...
+        #   }
+        # }
 
         self.latest_heartbeat = {} # str (node_id) -> float? (last time heartbeat was received)
 
@@ -86,7 +117,6 @@ class Node:
         self.own_streams = {}
 
         #asyncio stuff, dont worry about it :))))
-        self._shutdown_event = None
         self._async_tasks = []
 
 
@@ -129,36 +159,70 @@ class Node:
                     writer.write(msg.encode('ASCII'))
                     await writer.drain()
                 except Exception as e:
-                    await self.handle_death(peer_id)
+                    await self.catastrophy(peer_id)
 
     async def check_heartbeats(self):
         while True:
-            await asyncio.sleep(5) #arbitrary, choose another good value later maybe
+            await asyncio.sleep(20) #arbitrary, choose another good value later maybe
             now = time.time()
             for peer_id, last in self.latest_heartbeat.items():
                 if now - last > HEARTBEAT_TIMEOUT:
-                    await self.handle_death(peer_id)
+                    await self.catastrophy(peer_id)
                     
-            print(self.streams)
-            if self.is_server:
-                print(self.own_streams)
-            print(self.stream_backups)
-            print('')
-            print('')
+            #self.print_streams()
+
+
+    def print_streams(self):
+        for stream_id, stream_info in self.streams.items():
+            best = stream_info["best"]
+            backup = stream_info["backup"]
+
+            print(f'Stream: {stream_id}')
+            print(f'\t| Best provision:')
+            print(f'\t\t| provider: {best["provider"]}')
+            print(f'\t\t| heuristic: {best["heuristic"]}')
+
+            print(f'\t| Backups:')
+            for provider, info in backup.items():
+                print(f'\t\t| {provider} : ', end='')
+                if info["parent"]:
+                    print(f'PARENT')
+                else:
+                    print(f'{info["heuristic"]}')
+
+            print('\n')
+
+        if self.is_server:
+            for stream_id, stream_info in self.own_streams.items():
+                print(f'[OWN] Stream: {stream_id}')
+
+    def print_peers(self):
+        if not self.peers:
+            print('No peers!')
+            return
+        
+        print(f'Peers:')
+        for peer in self.peers.keys():
+            print(f'\t- {peer}')
 
 
     async def connect_to_peer(self, peer_id, peer_address): #CAREFULL! MIGHT THROW EXCEPTION!
         if peer_id in self.peers.keys():
             return 1
         
+
+        #print(f'[{peer_id}] open connetion on {peer_address}:{TCP_PORT}')
         reader, writer = await asyncio.open_connection(peer_address, TCP_PORT)
 
-        writer.write(MSG_HANDSHAKE.encode('ASCII') + self.name.encode('ASCII') + b'\n')
+        #print(f'[{peer_id}] send handshake')
+        writer.write(f'{MSG_HANDSHAKE}{self.name}\n'.encode('ASCII'))
         await writer.drain()
 
+        #print(f'[{peer_id}] wait for response')
         data = await reader.readline()
         msg = data.decode('ASCII').strip(' \n')
 
+        #print(f'[{peer_id}] response received')
         if msg[0] != ANS_HANDSHAKE:
             return 2
         
@@ -172,26 +236,24 @@ class Node:
         successes = 0
         peers = {}
         for peer_id, peer_address in self.peer_addresses.items():   
+            #print(f"Attempting to connect to peer {peer_id}...", end="")
             try:
-                print(f"Attempting to connect to peer {peer_id}...", end="")
                 res = await self.connect_to_peer(peer_id, peer_address)
-
-                if res == 1:
-                    print(' peer was already registered. Continuing...')
-                    continue
-                elif res == 2:
-                    print(" failed! Peer didn't answer handshake!")
-                    continue
-                
-                else:
-                    peers[peer_id] = res # res has (reader, writer) in case of success
-
-            except:
-                print(" failed!")
+            except Exception as e:
+                #print(f" failed!")
                 continue
 
-            print(" success!")
-            successes += 1
+            if res == 1:
+                #print(' peer was already registered. Continuing...')
+                continue
+            elif res == 2:
+                #print(" failed! Peer didn't answer handshake!")
+                continue
+            
+            else:
+                peers[peer_id] = res # res has (reader, writer) in case of success
+                #print(" success!")
+                successes += 1
 
         for peer_id, (reader, writer) in peers.items():
             self.peers[peer_id] = (reader, writer)
@@ -202,9 +264,11 @@ class Node:
 
 
     async def listen_to_peer(self, peer_id):
-        reader, writer = self.peers[peer_id]
+        #print(f'listening to {peer_id}')
+        reader, _ = self.peers[peer_id]
         try:
             while True:
+                #print(f'wait for read {peer_id}')
                 data = await reader.readline()
                 if not data:
                     break
@@ -216,16 +280,31 @@ class Node:
         except Exception as e:
             print(e)
         finally:
-            await self.handle_death(peer_id)
+            await self.catastrophy(peer_id)
+
+
+    def pop_parent_backup(self, stream_id):
+        if len(self.streams[stream_id]['backup']) == 1:
+            (provider, info), = self.streams[stream_id]['backup'].items()
+            if info['parent'] == True:
+                self.streams[stream_id]['backup'].pop(provider)
+
+    def remove_from_backup(self, stream_id, provider_id):
+        self.streams[stream_id]['backup'].pop(provider_id)
 
 
     async def process_request(self, peer_id, message):
-        reader, writer = self.peers[peer_id]
+        _, writer = self.peers[peer_id]
 
         msg_type = message[0]
-        msg = message[1:]
+
+        if len(message) == 1:
+            msg = ''
+        else:
+            msg = message[1:]
         
         #print(f"[{peer_id}]: {msg_type} , {msg}")
+
         if msg_type == MSG_HEARTBEAT:
             self.latest_heartbeat[peer_id] = time.time()
             #print(f"Heartbeat received from {peer_id}.")
@@ -238,8 +317,19 @@ class Node:
             # open UDP channel and start stream
             print(f"Stream {msg} provided by {peer_id}.")
             
+        elif msg_type == UNPROVIDE_STREAM:
+            #TODO: finish this !
+            
+            stream_list = msg.split(';')
+
+            #step 1, gather all streams peer provides and backups with matching IDS
+
+            #step 2, remove backups provided by peer and remove provided streams and switch to backups
+
+            #step 3, notify changes (if stream provider changed!)
+
         elif msg_type == FLOOD_STREAM:
-            #print(f'FLOOD Received from {peer_id}')
+            print(f'FLOOD Received from {peer_id}')
 
             streams_raw = msg.split(';')
             streams = []
@@ -247,17 +337,25 @@ class Node:
                 stream_id, info = stream.split(':')
                 stream_info = info.split(',')
                 #TODO : change later when using metrics
+                #TODO : CALCULATE HEURISTIC HERE!
                 jumps = stream_info[0]
                 streams.append((stream_id, int(jumps) + 1))
 
             altered_streams = [] # just to keep track of what streams we need to flood
 
-            for stream_id, n_jumps in streams:
+            for stream_id, heuristic in streams:
                 if stream_id not in self.streams:
+                    print(f'Stream {stream_id} wasnt known.')
+
                     self.streams[stream_id] = {
-                        "n_jumps": n_jumps,
-                        "provider": peer_id,
-                        "consumers": set(),
+                        'best': {},
+                        'backup': {}
+                    }
+
+                    self.streams[stream_id]["best"] = {
+                        "heuristic" : heuristic,
+                        "provider" : peer_id,
+                        "consumers" : set(),
                     }
                     altered_streams.append(stream_id)
                     
@@ -265,78 +363,74 @@ class Node:
                     await self.request_parent(stream_id, peer_id)
                 else:
                     #stream already existed
+                    print(f'Stream {stream_id} was already known!')
                     
-                    if n_jumps < self.streams[stream_id]["n_jumps"]:
-                        old_stream = self.streams[stream_id]
-                        
-                        self.streams[stream_id]["n_jumps"] = n_jumps
-                        self.streams[stream_id]["provider"] = peer_id
-                        altered_streams.append(stream_id)
-                    
-                        backup = self.stream_backups.get(stream_id, None)
-                        if not backup: #if no backups, just make sure its a dict (instead of None)
-                            self.stream_backups[stream_id] = {}
-                        if len(self.stream_backups[stream_id]) == 1:
-                            (provider, backup_info), = self.stream_backups[stream_id].items()
-                            if backup_info['parent']: #this is a boolean that identifies if backup is 'parent request' type
-                                self.stream_backups[stream_id].pop(provider)
-                        
-                        self.stream_backups[stream_id][old_stream['provider']] = {
-                            "provider_ip": "0.0.0.0",
-                            "parent": False,
-                            "metrics": old_stream['n_jumps']
-                        }
-                        
+                    #if peer is already provider, just update heuristic and metrics (if better)
+                    if peer_id == self.streams[stream_id]["best"]["provider"]:
+                        #just update metrics if better, no backup change
+                        #note, maybe instead of changing whenever the heuristic changes, only change when the difference is above a certain 'threshold'
+                        if heuristic < self.streams[stream_id]["best"]["heuristic"]:
+                            self.streams[stream_id]["best"]["heuristic"] = heuristic
+                            altered_streams.append(stream_id)
+
                     else:
-                        #no switching done, straight to backup
-                        
-                        #now, we should always have at least one backup
-                        #that being the parent provider of the first
-                        #provider.
-                        
-                        #but, just to be safe, we should definitelly check for that
-                        
-                        backup = self.stream_backups.get(stream_id, None)
-                        
-                        if not backup: #if no backups, just make sure its a dict (instead of None)
-                            self.stream_backups[stream_id] = {}
-                            
-                        #now, if there are 0 backups, the new message will become the backup
-                        #if there are 2 or more backups, we are SURE that no backup is a 'parent request' backup
-                        #if there is just 1 backup, we need to check if it is a 'parent request' backup and
-                        #delete it
-                        
-                        if len(self.stream_backups[stream_id]) == 1:
-                            (provider, backup_info), = self.stream_backups[stream_id].items()
-                            if backup_info['parent']: #this is a boolean that identifies if backup is 'parent request' type
-                                self.stream_backups[stream_id].pop(provider)
-                                
-                        
-                        #now, after we confirmed that no remaining backups are 'parent requests'
-                        #we just need to insert new stream provision into backups!
-                        
-                        self.stream_backups[stream_id][peer_id] = {
-                            "provider_ip": "0.0.0.0",
-                            "parent": False,
-                            "metrics": n_jumps
-                        }
+                        #if better, switch and keep old provider as backup
+                        #if worse, just go straight to backup
+
+                        if heuristic < self.streams[stream_id]["best"]["heuristic"]:
+                            print(f'And its better')
+
+                            old_best = self.streams[stream_id]["best"]
+
+                            self.streams[stream_id]["best"]["heuristic"] = heuristic
+                            self.streams[stream_id]["best"]["provider"] = peer_id
+                            altered_streams.append(stream_id)
+
+                            self.pop_parent_backup(stream_id)
+                            self.remove_from_backup(stream_id, peer_id)
+
+
+                            backup = {
+                                'parent': False,
+                                'parent_ip': None,
+                                'heuristic': old_best["heuristic"]
+                                #<metric> : old_best['metric']
+                            }
+
+                            self.streams[stream_id]["backup"][old_best["provider"]] = backup
+
+                        else:
+                            print(f'It was not better')
+                            #no switching done, straight to backup
+
+                            self.pop_parent_backup(stream_id)         
+
+                            backup = {
+                                "provider_ip": "0.0.0.0",
+                                "parent": False,
+                                "heuristic": heuristic
+                            }
+
+                            self.streams[stream_id]["backup"][peer_id] = backup
                         
             #flood
             await self.flood(altered_streams)
         
         elif msg_type == REQ_PARENT:
             stream_id = msg
-            print(f'Parent requested from {peer_id} for {stream_id}.')
+            #print(f'Parent requested from {peer_id} for {stream_id}.')
 
             if self.is_server:
-                #TODO: tell parent provider is self in case of is_server
-                print("TODO")
+                if stream_id in self.own_streams.keys():
+                    writer.write(f'{ANS_PARENT}{stream_id};{self.name};0.0.0.0\n'.encode('ASCII'))
+                    await writer.drain()
+                    return
 
             if stream_id in self.streams.keys():
                 #it exists!
                 #note, since the stream is being provided, the parent provider is
                 # GUARANTEED to be a peer. 
-                info = self.streams[stream_id]
+                info = self.streams[stream_id]['best']
                 provider = info["provider"]
                 provider_address = self.peer_addresses[provider]
 
@@ -349,49 +443,33 @@ class Node:
 
         elif msg_type == ANS_PARENT:
             fields = msg.split(';')
+
+            if len(fields) != 3:
+                print(f'SOMETHING WENT AWRY: {peer_id}: [{msg_type}] {msg}')
+                return
             
             stream_id = fields[0]
-            parent_name = fields[1]
+            parent_id = fields[1]
             parent_address = fields[2]
 
             if stream_id in self.parent_requests:
                 self.parent_requests.pop(self.parent_requests.index(stream_id))
 
-                backups = self.stream_backups.get(stream_id, None)
-                
-                if not backups:
-                    self.stream_backups[stream_id] = {}
-                    self.stream_backups[stream_id][parent_name] = {
-                                    "provider_ip": parent_address,
-                                    "parent": True
+                #TODO: Check if provider is root, if so, set 'root' field to true
+                if parent_id == self.streams[stream_id]["best"]["provider"]:
+                    print('THIS IS A ROOT PROVIDER, TODO')
+
+                self.pop_parent_backup(stream_id)
+                if not self.streams[stream_id]["backup"]:
+                    backup = {
+                        'parent': True,
+                        'parent_ip': parent_address
                     }
-                    
-                # check if backup is parent.
-                # if so, replace
-                
-                elif len(backups) == 1:
-                    (provider, info), = backups.items()
-                    if info['parent']:
-                        self.stream_backups[stream_id].pop(provider)
-                        
-                    self.stream_backups[stream_id][parent_name] = {
-                                    "provider_ip": parent_address,
-                                    "parent": True
-                    }
+
+                    self.streams[stream_id]["backup"][parent_id] = backup
 
             else:
                 print(f"Request for parent of {stream_id} was either already satisfied or never existed.")    
-
-        elif msg_type == UNPROVIDE_STREAM:
-            #TODO: finish this !
-            
-            stream_list = msg.split(';')
-
-            #step 1, gather all streams peer provides and backups with matching IDS
-
-            #step 2, remove backups provided by peer and remove provided streams and switch to backups
-
-            #step 3, notify changes (if stream provider changed!)
 
         elif msg_type == MSG_SHUTDOWN:
             print(f'Shutdown from {peer_id}!')
@@ -406,53 +484,61 @@ class Node:
 
 
     async def flood(self, stream_ids, is_own=False):
+        if not stream_ids:
+            print('EMPTY FLOOD, RETURNING')
+            return
         streams = {}
+        print(f'Flood called with {stream_ids}')
 
         #setup !
         for stream_id in stream_ids:
             if is_own:
-                stream_info = self.own_streams.get(stream_id, None)
-                if stream_info is None:
+                best_provision = self.own_streams.get(stream_id, None)
+                if best_provision is None:
                     print(f'Warning: attempting to flood own {stream_id} that does not exist. Ignoring...')
                     continue
 
-                n_jumps = 0
+                heuristic = 0
                 provider = None
 
-                streams[stream_id] = (n_jumps, provider)
+                streams[stream_id] = (heuristic, provider)
 
             else:
-                stream_info = self.streams.get(stream_id, None)
-                if stream_info is None:
+                stream = self.streams.get(stream_id, None)
+                if not stream:
                     print(f'Warning: attempting to flood {stream_id} that does not exist. Ignoring...')
 
-                n_jumps = stream_info['n_jumps']
-                provider = stream_info['provider']
+                best_provision = stream["best"]
 
-                streams[stream_id] = (n_jumps, provider)
+                provider = best_provision["provider"]
+                heuristic = best_provision["heuristic"]
+
+                streams[stream_id] = (heuristic, provider)
 
         for peer_id in self.peers.keys():
-            reader, writer = self.peers[peer_id]
-            to_flood = []
+            _, writer = self.peers[peer_id]
+
+            to_flood = 0
+            msg_str = f"{FLOOD_STREAM}"
 
             for stream_id in streams.keys():
-                n_jumps, provider = streams[stream_id]
-                if peer_id != provider:
-                    to_flood.append(stream_id)
+                heuristic, provider = streams[stream_id]
+                if self.is_server and is_own:
+                    msg_str += f'{stream_id}:{heuristic};'
+                    to_flood += 1
+                elif peer_id != provider and peer_id not in self.streams[stream_id]["backup"].keys(): 
+                    #dont send to backup providers!
+                    msg_str += f'{stream_id}:{heuristic};'
+                    to_flood += 1
 
-
-            if not to_flood:
+            if to_flood == 0:
+                # no streams to be flooded, no work to be done
+                print(f'Flooding nothing to {peer_id}.')
                 continue
-            
-            msg_str = f"{FLOOD_STREAM}"
-            for stream_id in to_flood:
-                n_jumps, _ = streams[stream_id]
-                #TODO: change to use metrics and add any necessary stuff later
-                msg_str += f'{stream_id}:{n_jumps};'
 
-            #substitute trailing ; by \n
-            
+
             msg_str = msg_str[:-1] + '\n'
+            print(f'Sending following message to {peer_id}: {msg_str}', end='')
 
             msg = msg_str.encode('ASCII')
 
@@ -461,10 +547,10 @@ class Node:
             
                  
     async def flood_all(self):
-        #if self.streams:
-        #    print("Called flood_all, not empty")
-        #else:
-        #    print("Called flood_all, empty")
+        if self.streams:
+            print("Called flood_all, not empty")
+        else:
+            print("Called flood_all, empty")
 
         if self.is_server:
             await self.flood(list(self.own_streams.keys()), True)
@@ -473,6 +559,8 @@ class Node:
 
 
     async def request_parent(self, stream_id, peer_id, peer = None):
+        print(f'Requesting parent for stream {stream_id} from peer {peer_id}.')
+
         if peer:
             _, writer = peer
         else:
@@ -489,30 +577,34 @@ class Node:
 
 
     async def handle_connection(self, reader, writer):
+        #print('CONNECTION!')
+
         handshake_raw = await reader.readline()
         handshake = handshake_raw.decode('ASCII').strip(' \n')
 
         if handshake[0] != MSG_HANDSHAKE:
+            #print('not handshake!')
             writer.write(MSG_ERROR.encode('ASCII') + b'\n')
             await writer.drain()
             return
 
         else:
+            peer_id = handshake[1:]
+            #print(f'[{peer_id}] is handshake, sending response')
+
             writer.write(ANS_HANDSHAKE.encode('ASCII') + b'\n')
             await writer.drain()
 
-            peer_id = handshake[1:]
+            #print(f'[{peer_id}] sent')
 
             #print(f'Received handshake from {peer_id}.')
 
             self.peers[peer_id] = (reader, writer)
             self.latest_heartbeat[peer_id] = time.time()
             
-            
             await self.flood_all()
 
             self._async_tasks.append(asyncio.create_task(self.listen_to_peer(peer_id)))
-
 
     #this version handles death when peer sends a shutdown signal
     async def handle_death(self, peer_id):
@@ -583,10 +675,15 @@ class Node:
 
             print(f"Closed connection with {peer_id}.")
 
-
+    #this version handles death of catastrophic proportions
     async def catastrophy(self, peer_id):
         print(f'Peer {peer_id} has died without notifying.')
         #TODO: handle sudden death 
+        print(f'TODO')
+        self.peers.pop(peer_id)
+        #TODO: REMEMBER TO REMOVE ALL STREAMS THAT IT PROVIDED, ALONG WITH BACKUPS
+        # if backup was parent, establish connection.
+        # if root provider (server crashed) notify that stream is no longer being provided
 
 
     def load_manifest(self):
@@ -630,27 +727,17 @@ class Node:
                 print(f'Manifest at "{self.sv_manifest_path}" is invalid.')
                 return 1
 
-        self._shutdown_event = asyncio.Event()
-        loop = asyncio.get_running_loop()
-
-        loop.add_signal_handler(signal.SIGINT, self._on_signal)
-        loop.add_signal_handler(signal.SIGTERM, self._on_signal)
+        await self.connect_to_peers()
 
         self.server = await asyncio.start_server(self.handle_connection, self.host, TCP_PORT)
         # from now on, server is listening
-
-        self._async_tasks.append(asyncio.create_task(self.connect_to_peers()))
+        
         self._async_tasks.append(asyncio.create_task(self.heartbeat_loop()))
         self._async_tasks.append(asyncio.create_task(self.check_heartbeats()))
+        self._async_tasks.append(asyncio.create_task(self.menu()))
 
         async with self.server:
-            await self._shutdown_event.wait()
-
-        await self.shutdown()
-
-
-    def _on_signal(self):
-        self._shutdown_event.set()
+            await self.server.serve_forever()
 
 
     async def shutdown(self):
@@ -686,6 +773,47 @@ class Node:
 
         print(' done!') 
 
+
+    async def menu(self):
+        #await asyncio.sleep(2)
+        while True:
+            # DISPLAY OPTIONS FIRST!!!!!!
+            print('\n\n\n>==================================================<')
+            print('1 - Display Streams')
+            print('2 - Display Peers')
+            print('3 - Shutdown')
+
+            uinput = await async_input("\nChoice: ")
+            try:
+                choice = int(uinput)
+            except:
+                print(f'Invalid choice {uinput}')
+                continue
+
+            if choice == 1:
+                self.print_streams()
+            elif choice == 2:
+                self.print_peers()
+            elif choice == 3:
+                print('Come back later :)')
+            else:
+                print(f'Invalid choice {uinput}')
+
+
+#messy code to have asynchronous input!!!!!
+#ignore
+
+async def to_thread(func, /, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, functools.partial(func, *args, **kwargs)
+    )
+
+async def async_input(prompt : str = ""):
+    return await to_thread(input, prompt)
+
+
+#back to normal :)
 
 def main():
     parser = argparse.ArgumentParser()
