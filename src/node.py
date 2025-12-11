@@ -36,7 +36,9 @@ MSG_HEARTBEAT = 'B'            #        send heartbeat:    [B][\n]
 
 FLOOD_STREAM = 'F'             #       stream metadata:    [F][STREAM_ID][stream_1][stream_2*]...[stream_N*][\n]    *optional
 # each stream is as follows:
-#   stream_id [str]: n_jumps(for now) [int]
+#   stream_id:root_provider_id,version,n_jumps,heuristic,<metrics here>
+#      str       str            int     int      float       ???
+
 REQ_PARENT = 'P'               #  req. parent provider:    [P][STREAM_ID]
 ANS_PARENT = 'R'               #  ans. parent provider:    [R][STREAM_ID][PARENT_NAME][PARENT_ADDRESS]
 
@@ -68,41 +70,40 @@ class Node:
         
         self.peers = {} # str (node_id) -> (Reader, Writer)    |< this is the structure given by asyncio!
         self.peers_udp = {} # probably the same as above
+
+        self.link_stats = {} # peer_id -> {metrics, link cost?}
         
         self.streams = {}               
         # dict
-        # has 'best' field, keeping track of best provider and it's metrics
-        # has 'backup' field, keeping track of all available backup providers
-        # it maps 'stream_id' to this pair.
 
-        # best field has following stucture:
-        # {
-        #   'provider' : str        # id of stream provider
-        #   'consumers': set()      # keeps track of active consumers (maybe its unnecessary?)
-        #   'root': bool            # if provider is root, it means no backup provider exists, so we need to handle this case carefully
-        #   'heuristic': float      # heuristic used to choose best provider. for now it's just n_jumps
-        #   <METRICS>  : TYPE       # undefined as is for now, maybe have latency, loss, bandwidth, etc
-        #                           # these metrics SHALL BE only the cummulative of previous jumps
-        #                           # peer connection metrics will only be tacked on if calculating heuristic or 
-        #                           # sending it forth!
-        #
-        #   'metadata': str         # still dont really know what to put here. perhaps video bitrate??? maybe its unnecessary
-        # } 
-
-        # backup field has following structure:
-        # {
-        #   provider_id1 [str] : {
-        #        'parent' : bool    # if backup provider is actually peer or requested parent provider (emergency backup)
-        #        'parent_ip': str   # address of parent provider (only used when 'parent' is True)
-        #        'heuristic': float # heuristic of backup connection (only present when 'parent' is False)
-        #        <METRICS> : TYPE   # list of accumulated metrics without peer metrics (only present when 'parent' is False)
-        #                           #'metadata': str    # maybe this is pointless, since metadata should be static
-        #   },
-        #   ...
-        #   provider_idn [str]: {
-        #        ...
+        #format:
+        #self.streams = {
+        #   'stream_id': {
+        #       'current_root': 'root_id',
+        #       'provisions': {
+        #           'root_id': {                                #root id will be the id of the providing server
+        #               'version': int (current tree version)
+        #               'best': {
+        #                   'provider': str,        (parent id)
+        #                   'n_jumps': int,         (jumps from root to self, might be useful?)
+        #                   'heuristic': float,     (local cost, which means provider cost + link cost) (COST IS FROM THIS NODE TO ROOT, NOT PARENT TO ROOT)
+        #                   'metrics': {...}        (these are parent only, link costs are stored somewhere else)
+        #               },
+        #               'backup': {
+        #                   'backup_provider': {
+        #                       'parent': bool,             (if backup is parent provider for self-healing)
+        #                       'parent_ip': str | None,    (only set if parent)
+        #                       'n_jumps': int,             (jumps from root to self)
+        #                       'heuristic': float,         (local cost)
+        #                       'metrics': {...}            (parent only)
+        #                   }
+        #               }
+        #           },
+        #           ...
+        #       }
         #   }
-        # }
+        #}
+
 
         self.latest_heartbeat = {} # str (node_id) -> float? (last time heartbeat was received)
 
@@ -115,9 +116,30 @@ class Node:
         self.is_server = server_manifest_path is not None
         self.sv_manifest_path = server_manifest_path
         self.own_streams = {}
+        self.current_version = 0
 
         #asyncio stuff, dont worry about it :))))
         self._async_tasks = []
+
+
+    #server only
+    def load_manifest(self):
+        if not self.is_server:
+            #print("Attempting to load manifest while not a server.")
+            return 1
+
+        try:
+            with open(self.sv_manifest_path, 'r') as file:
+                data = json.load(file)['streams']
+            if not data:
+                return 2
+            
+            for stream_id in data.keys():
+                stream_info = {"consumers": set(), "metadata": data[stream_id]}
+                self.own_streams[stream_id] = stream_info
+        except Exception as e:
+            print(e)
+            return 2
 
 
     def get_peers(self):
@@ -150,6 +172,7 @@ class Node:
             return 0
 
 
+
     async def heartbeat_loop(self):
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -172,23 +195,27 @@ class Node:
             #self.print_streams()
 
 
+
     def print_streams(self):
-        for stream_id, stream_info in self.streams.items():
-            best = stream_info["best"]
-            backup = stream_info["backup"]
+        if not self.streams:
+            print('\nNo streams yet!')
+            return 
+         
+        print('')
+        for stream_id, stream_state in self.streams.items():
+            current_root = stream_state["current_root"]
 
             print(f'Stream: {stream_id}')
-            print(f'\t| Best provision:')
-            print(f'\t\t| provider: {best["provider"]}')
-            print(f'\t\t| heuristic: {best["heuristic"]}')
-
-            print(f'\t| Backups:')
-            for provider, info in backup.items():
-                print(f'\t\t| {provider} : ', end='')
-                if info["parent"]:
-                    print(f'PARENT')
-                else:
-                    print(f'{info["heuristic"]}')
+            print(f'\t| Best provision: {current_root}')
+            for root_id, provision_state in stream_state["provisions"].items():
+                tree_version = provision_state["version"]
+                best = provision_state["best"]
+                backup = provision_state["backup"]
+                print(f'\t| Root {root_id} (version {tree_version}):')
+                print(f'\t\t| Best: {best["provider"]} (total cost: {best["heuristic"]}, jumps: {best["n_jumps"]})')
+                print(f'\t\t| Backups: ')
+                for backup_id, backup_state in backup.items():
+                    print(f'\t\t\t| Provider {backup_id}:  cost: {backup_state["heuristic"]}, jumps: {backup_state["n_jumps"]}')
 
             print('\n')
 
@@ -198,12 +225,13 @@ class Node:
 
     def print_peers(self):
         if not self.peers:
-            print('No peers!')
+            print('\nNo peers yet!')
             return
         
-        print(f'Peers:')
+        print(f'\nPeers:')
         for peer in self.peers.keys():
             print(f'\t- {peer}')
+
 
 
     async def connect_to_peer(self, peer_id, peer_address): #CAREFULL! MIGHT THROW EXCEPTION!
@@ -230,7 +258,6 @@ class Node:
         self.latest_heartbeat[peer_id] = time.time()
 
         return (reader, writer)
-
 
     async def connect_to_peers(self):
         successes = 0
@@ -263,6 +290,9 @@ class Node:
             await self.flood_all()
 
 
+    #def update_stream_register(self, stream_id : str, root_provider_id : str, provider_id : str):
+
+
     async def listen_to_peer(self, peer_id):
         #print(f'listening to {peer_id}')
         reader, _ = self.peers[peer_id]
@@ -291,7 +321,24 @@ class Node:
 
     def remove_from_backup(self, stream_id, provider_id):
         self.streams[stream_id]['backup'].pop(provider_id)
+    
 
+    async def request_parent(self, stream_id, peer_id, peer = None):
+        print(f'Requesting parent for stream {stream_id} from peer {peer_id}.')
+
+        if peer:
+            _, writer = peer
+        else:
+            _, writer = self.peers[peer_id]
+
+        msg_str = f'{REQ_PARENT}{stream_id}\n'
+        msg = msg_str.encode('ASCII')
+
+        if stream_id not in self.parent_requests:
+            self.parent_requests.append(stream_id)
+
+            writer.write(msg)
+            await writer.drain()
 
     async def process_request(self, peer_id, message):
         _, writer = self.peers[peer_id]
@@ -332,88 +379,21 @@ class Node:
             print(f'FLOOD Received from {peer_id}')
 
             streams_raw = msg.split(';')
-            streams = []
+            altered_streams = []
+            link_cost = 1 #temporary value!!!!!!, use metrics when i have it TODO
+
             for stream in streams_raw:
                 stream_id, info = stream.split(':')
                 stream_info = info.split(',')
-                #TODO : change later when using metrics
-                #TODO : CALCULATE HEURISTIC HERE!
-                jumps = stream_info[0]
-                streams.append((stream_id, int(jumps) + 1))
+                root_provider = stream_info[0]
+                tree_version = stream_info[1]
+                jumps = int(stream_info[2]) + 1
+                heuristic = float(stream_info[3]) + link_cost
+                #streams.append((stream_id, root_provider, tree_version, jumps, heuristic))
+                if self.handle_flood(peer_id, stream_id, root_provider, tree_version, jumps, heuristic):
+                    altered_streams.append((stream_id, root_provider))
 
-            altered_streams = [] # just to keep track of what streams we need to flood
-
-            for stream_id, heuristic in streams:
-                if stream_id not in self.streams:
-                    print(f'Stream {stream_id} wasnt known.')
-
-                    self.streams[stream_id] = {
-                        'best': {},
-                        'backup': {}
-                    }
-
-                    self.streams[stream_id]["best"] = {
-                        "heuristic" : heuristic,
-                        "provider" : peer_id,
-                        "consumers" : set(),
-                    }
-                    altered_streams.append(stream_id)
-                    
-                    #since stream did not exist, request parent provider
-                    await self.request_parent(stream_id, peer_id)
-                else:
-                    #stream already existed
-                    print(f'Stream {stream_id} was already known!')
-                    
-                    #if peer is already provider, just update heuristic and metrics (if better)
-                    if peer_id == self.streams[stream_id]["best"]["provider"]:
-                        #just update metrics if better, no backup change
-                        #note, maybe instead of changing whenever the heuristic changes, only change when the difference is above a certain 'threshold'
-                        if heuristic < self.streams[stream_id]["best"]["heuristic"]:
-                            self.streams[stream_id]["best"]["heuristic"] = heuristic
-                            altered_streams.append(stream_id)
-
-                    else:
-                        #if better, switch and keep old provider as backup
-                        #if worse, just go straight to backup
-
-                        if heuristic < self.streams[stream_id]["best"]["heuristic"]:
-                            print(f'And its better')
-
-                            old_best = self.streams[stream_id]["best"]
-
-                            self.streams[stream_id]["best"]["heuristic"] = heuristic
-                            self.streams[stream_id]["best"]["provider"] = peer_id
-                            altered_streams.append(stream_id)
-
-                            self.pop_parent_backup(stream_id)
-                            self.remove_from_backup(stream_id, peer_id)
-
-
-                            backup = {
-                                'parent': False,
-                                'parent_ip': None,
-                                'heuristic': old_best["heuristic"]
-                                #<metric> : old_best['metric']
-                            }
-
-                            self.streams[stream_id]["backup"][old_best["provider"]] = backup
-
-                        else:
-                            print(f'It was not better')
-                            #no switching done, straight to backup
-
-                            self.pop_parent_backup(stream_id)         
-
-                            backup = {
-                                "provider_ip": "0.0.0.0",
-                                "parent": False,
-                                "heuristic": heuristic
-                            }
-
-                            self.streams[stream_id]["backup"][peer_id] = backup
-                        
-            #flood
+            #flood necessary
             await self.flood(altered_streams)
         
         elif msg_type == REQ_PARENT:
@@ -482,8 +462,131 @@ class Node:
         else:
             print(f"Unknown message type {msg_type} from {peer_id}.")
 
+    #return True if needs reflooding, False otherwise
+    def handle_flood(self, peer_id, stream_id, root_id, tree_version, n_jumps, heuristic): #later on, pass on metrics
+        stream_state = self.streams.get(stream_id, None)
+        if not stream_state:
+            #stream itself doesnt have registry
+            self.streams[stream_id] = {
+                "current_root": root_id,
+                "provisions": {
+                    root_id: {
+                        "version": tree_version,
+                        "best": {
+                            "provider": peer_id,
+                            "n_jumps": n_jumps,
+                            "heuristic": heuristic
+                            #metrics: {...}
+                        },
+                        "backup": {}
+                    }
+                }
+            }
+            return True
 
-    async def flood(self, stream_ids, is_own=False):
+        provision_state = stream_state["provisions"].get(root_id, None)
+        if not provision_state:
+            #specific provision from root doesnt have registry
+            provision = {
+                "version": tree_version,
+                "best": {
+                    "provider": peer_id,
+                    "n_jumps": n_jumps,
+                    "heuristic": heuristic
+                    #metrics: { ... }
+                },
+                "backup": {}
+            }
+            self.streams[stream_id]["provisions"][root_id] = provision
+            self.choose_best_provision(stream_id)
+            return True
+        
+
+        if provision_state["best"]["provider"] == peer_id:
+            #best is already peer, update stuff and reflood
+            best = {
+                "provider": peer_id,
+                "n_jumps": n_jumps,
+                "heuristic": heuristic
+                #metrics: { ... }
+            }
+
+            self.streams[stream_id]["provisions"][root_id]["best"] = best
+            
+            #TODO: Only trigger reflood in case of drastic change when I have metrics
+            return True
+        
+        else:
+            #best isnt peer.
+            backup = {
+                "parent": False,
+                "parent_ip": None,
+                "n_jumps": n_jumps,
+                "heuristic": heuristic
+                #metrics: { ... }
+            }
+
+            self.streams[stream_id]["provisions"][root_id]["backup"][peer_id] = backup
+            return self.choose_best_path(stream_id, root_id)
+
+    def choose_best_provision(self, stream_id):
+        stream_state = self.streams.get(stream_id, None)
+        if not stream_state:
+            return
+        
+        best_heuristic = float("inf")
+        best_root = stream_state["current_root"]
+        for root_id, root_state in stream_state["provisions"].items():
+            if root_state["best"]["heuristic"] < best_heuristic:
+                best_heuristic = root_state["best"]["heuristic"]
+                best_root = root_id
+
+        self.streams[stream_id]["current_root"] = best_root
+
+    def choose_best_path(self, stream_id, root_id):
+        stream_state = self.streams.get(stream_id, None)
+        if not stream_state:
+            return False
+        
+        provision_state = stream_state["provisions"].get(root_id, None)
+        if not provision_state:
+            return False
+        
+        #BOTH OF THESE RETURNS ARE JUST BACKUP CHECKS AND SHOULD NEVER BE TRIGGERED IN NORMAL OPERATION
+
+        best_provider = provision_state["best"]["provider"]
+        best_heuristic = provision_state["best"]["heuristic"]
+
+        for backup_provider, backup_state in provision_state["backup"].items():
+            if backup_state["heuristic"] < best_heuristic:
+                best_provider = backup_provider
+                best_heuristic = backup_state["heuristic"]
+
+        if best_provider != provision_state["best"]["provider"]:
+            old_best = provision_state["best"]
+
+            new_best = {
+                "provider": best_provider,
+                "n_jumps": provision_state["backup"][best_provider]["n_jumps"],
+                "heuristic": best_heuristic
+            }
+
+            self.streams[stream_id]["provisions"][root_id]["backup"].pop(best_provider)
+            self.streams[stream_id]["provisions"][root_id]["best"] = new_best
+
+            self.streams[stream_id]["provisions"][root_id]["backup"][old_best["provider"]] = {
+                "parent": False,
+                "parent_ip": None,
+                "n_jumps": old_best["n_jumps"],
+                "heuristic": old_best["heuristic"]
+            }
+
+            return True
+        
+        return False
+
+
+    """ async def flood(self, stream_ids, is_own=False):
         if not stream_ids:
             print('EMPTY FLOOD, RETURNING')
             return
@@ -544,36 +647,74 @@ class Node:
 
             writer.write(msg)
             await writer.drain()
-            
-                 
-    async def flood_all(self):
-        if self.streams:
-            print("Called flood_all, not empty")
-        else:
-            print("Called flood_all, empty")
+ """
+    
+    async def flood(self, items, is_own=False):
+        #items is a list of (stream_id, root_provider_id) pairs
+        if not items:
+            return
+        
+        streams = {}
 
-        if self.is_server:
-            await self.flood(list(self.own_streams.keys()), True)
+        for stream_id, root_id in items:
+            if is_own:
+                heuristic = 0
+                n_jumps = 0
+                version = self.current_version
+                streams[(stream_id, self.name)] = (heuristic, n_jumps, version)
+            else:
+                stream_state = self.streams.get(stream_id, None)
+                if not stream_state:
+                    continue
+                root_state = stream_state["provisions"].get(root_id, None)
+                if not root_state:
+                    continue
 
-        await self.flood(list(self.streams.keys()))
+                heuristic = root_state["best"]["heuristic"]
+                n_jumps = root_state["best"]["n_jumps"]
+                version = root_state["version"]
 
+                streams[(stream_id, root_id)] = (heuristic, n_jumps, version)
 
-    async def request_parent(self, stream_id, peer_id, peer = None):
-        print(f'Requesting parent for stream {stream_id} from peer {peer_id}.')
+        if not streams:
+            return
+        
+        for peer_id, (_, writer) in self.peers.items():
+            msg = f'{FLOOD_STREAM}'
+            to_flood = 0
 
-        if peer:
-            _, writer = peer
-        else:
-            _, writer = self.peers[peer_id]
+            for (stream_id, root_id), (heuristic, n_jumps, version) in streams.items():
+                self_provider = peer_id
+                if not is_own:
+                    self_provider = self.streams[stream_id]["provisions"][root_id]["best"]["provider"]
 
-        msg_str = f'{REQ_PARENT}{stream_id}\n'
-        msg = msg_str.encode('ASCII')
+                if not is_own and peer_id == self_provider:
+                    continue
 
-        if stream_id not in self.parent_requests:
-            self.parent_requests.append(stream_id)
+                msg += f'{stream_id}:{root_id},{version},{n_jumps},{heuristic};'
+                to_flood += 1
 
-            writer.write(msg)
+            if to_flood == 0:
+                continue
+
+            msg = msg[:-1] + '\n'
+            writer.write(msg.encode('ASCII'))
             await writer.drain()
+
+    async def flood_all(self):
+        items = []
+        if self.is_server:
+            for stream_id in self.own_streams.keys():
+                items.append((stream_id, None))
+            await self.flood(items, True)
+
+        items = []
+        for stream_id, stream_state in self.streams.items():
+            for root_id in stream_state["providers"].keys():
+                items.append(stream_id, root_id)
+
+        await self.flood(items)
+
 
 
     async def handle_connection(self, reader, writer):
@@ -685,24 +826,6 @@ class Node:
         # if backup was parent, establish connection.
         # if root provider (server crashed) notify that stream is no longer being provided
 
-
-    def load_manifest(self):
-        if not self.is_server:
-            #print("Attempting to load manifest while not a server.")
-            return 1
-
-        try:
-            with open(self.sv_manifest_path, 'r') as file:
-                data = json.load(file)['streams']
-            if not data:
-                return 2
-            
-            for stream_id in data.keys():
-                stream_info = {"n_jumps": 0, "provider": None, "consumers": set(), "metadata": data[stream_id]}
-                self.own_streams[stream_id] = stream_info
-        except Exception as e:
-            print(e)
-            return 2
 
 
     async def start(self):
