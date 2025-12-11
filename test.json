@@ -1,0 +1,30 @@
+{
+    "nodes": {
+        "server": {
+            "addresses": ["10.0.0.10"],
+            "neighbours": {
+                "router": "10.0.0.1"
+            }
+        },
+        "router": {
+            "addresses": ["10.0.0.1", "10.0.1.1"],
+            "neighbours": {
+                "server": "10.0.0.10",
+                "router2": "10.0.1.2"
+            }
+        },
+        "router2": {
+            "addresses": ["10.0.1.2", "10.0.2.1"],
+            "neighbours": {
+                "router": "10.0.1.1",
+                "client": "10.0.2.20"
+            }
+        },
+        "client": {
+            "addresses": ["10.0.2.20"],
+            "neighbours": {
+                "router2": "10.0.2.1"
+            }
+        }
+    }
+}
