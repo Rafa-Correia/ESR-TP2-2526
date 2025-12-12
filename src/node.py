@@ -39,8 +39,8 @@ FLOOD_STREAM = 'F'             #       stream metadata:    [F][STREAM_ID][stream
 #   stream_id:root_provider_id,version,n_jumps,heuristic,<metrics here>
 #      str       str            int     int      float       ???
 
-REQ_PARENT = 'P'               #  req. parent provider:    [P][STREAM_ID]
-ANS_PARENT = 'R'               #  ans. parent provider:    [R][STREAM_ID][PARENT_NAME][PARENT_ADDRESS]
+REQ_PARENT = 'P'               #  req. parent provider:    [P][STREAM_ID][ROOT_ID]
+ANS_PARENT = 'R'               #  ans. parent provider:    [R][STREAM_ID][ROOT_ID][PARENT_NAME][PARENT_ADDRESS]
 
 REQ_STREAM = 'S'               #      request a stream:    [S][STREAM_ID][\n]
 ANS_STREAM = 'A'               #      provide a stream:    [A][STREAM_ID][\n] # we should be opening a UDP connection after receiving this message
@@ -289,10 +289,6 @@ class Node:
         if successes > 0:       
             await self.flood_all()
 
-
-    #def update_stream_register(self, stream_id : str, root_provider_id : str, provider_id : str):
-
-
     async def listen_to_peer(self, peer_id):
         #print(f'listening to {peer_id}')
         reader, _ = self.peers[peer_id]
@@ -311,34 +307,6 @@ class Node:
             print(e)
         finally:
             await self.catastrophy(peer_id)
-
-
-    def pop_parent_backup(self, stream_id):
-        if len(self.streams[stream_id]['backup']) == 1:
-            (provider, info), = self.streams[stream_id]['backup'].items()
-            if info['parent'] == True:
-                self.streams[stream_id]['backup'].pop(provider)
-
-    def remove_from_backup(self, stream_id, provider_id):
-        self.streams[stream_id]['backup'].pop(provider_id)
-    
-
-    async def request_parent(self, stream_id, peer_id, peer = None):
-        print(f'Requesting parent for stream {stream_id} from peer {peer_id}.')
-
-        if peer:
-            _, writer = peer
-        else:
-            _, writer = self.peers[peer_id]
-
-        msg_str = f'{REQ_PARENT}{stream_id}\n'
-        msg = msg_str.encode('ASCII')
-
-        if stream_id not in self.parent_requests:
-            self.parent_requests.append(stream_id)
-
-            writer.write(msg)
-            await writer.drain()
 
     async def process_request(self, peer_id, message):
         _, writer = self.peers[peer_id]
@@ -393,60 +361,67 @@ class Node:
                 if self.handle_flood(peer_id, stream_id, root_provider, tree_version, jumps, heuristic):
                     altered_streams.append((stream_id, root_provider))
 
+                if self.in_emergency(stream_id, root_provider):
+                    await self.request_parent(stream_id, root_provider, peer_id)
+
             #flood necessary
             await self.flood(altered_streams)
         
         elif msg_type == REQ_PARENT:
-            stream_id = msg
+            message_fields = msg.split(';')
+            stream_id = message_fields[0]
+            root_id = message_fields[1]
             #print(f'Parent requested from {peer_id} for {stream_id}.')
 
             if self.is_server:
-                if stream_id in self.own_streams.keys():
-                    writer.write(f'{ANS_PARENT}{stream_id};{self.name};0.0.0.0\n'.encode('ASCII'))
+                if stream_id in self.own_streams.keys() and root_id == self.name:
+                    writer.write(f'{ANS_PARENT}{stream_id};{self.name};{self.name};0.0.0.0\n'.encode('ASCII'))
                     await writer.drain()
                     return
 
-            if stream_id in self.streams.keys():
-                #it exists!
-                #note, since the stream is being provided, the parent provider is
-                # GUARANTEED to be a peer. 
-                info = self.streams[stream_id]['best']
-                provider = info["provider"]
-                provider_address = self.peer_addresses[provider]
-
-                writer.write(f'{ANS_PARENT}{stream_id};{provider};{provider_address}\n'.encode('ASCII'))
+            stream_state = self.streams.get(stream_id, None)
+            if not stream_state:
+                writer.write(f'{MSG_ERROR}No stream {stream_id} known.\n'.encode('ASCII'))
                 await writer.drain()
                 
-            else:
-                writer.write(f'{MSG_ERROR}Provided stream_id is not known.\n'.encode('ASCII'))
+            provision_state = stream_state["provisions"].get(root_id)
+            if not provision_state:
+                writer.write(f'{MSG_ERROR}No provision {root_id} is known.\n'.encode('ASCII'))
                 await writer.drain()
+
+            provider = provision_state["best"]["provider"]
+            provider_ip = self.peer_addresses[provider]
+
+            writer.write(f'{ANS_PARENT}{stream_id};{root_id};{provider};{provider_ip}\n'.encode('ASCII'))
+            await writer.drain()
 
         elif msg_type == ANS_PARENT:
             fields = msg.split(';')
 
-            if len(fields) != 3:
+            if len(fields) != 4:
                 print(f'SOMETHING WENT AWRY: {peer_id}: [{msg_type}] {msg}')
                 return
             
             stream_id = fields[0]
-            parent_id = fields[1]
-            parent_address = fields[2]
+            root_id = fields[1]
+            parent_id = fields[2]
+            parent_address = fields[3]
 
-            if stream_id in self.parent_requests:
-                self.parent_requests.pop(self.parent_requests.index(stream_id))
+            if (stream_id, root_id) in self.parent_requests:
+                self.parent_requests.pop(self.parent_requests.index((stream_id, root_id)))
 
                 #TODO: Check if provider is root, if so, set 'root' field to true
-                if parent_id == self.streams[stream_id]["best"]["provider"]:
+                if root_id == parent_id:
                     print('THIS IS A ROOT PROVIDER, TODO')
 
-                self.pop_parent_backup(stream_id)
-                if not self.streams[stream_id]["backup"]:
+                #self.pop_parent_backup(stream_id)
+                if not self.streams[stream_id]["provisions"][root_id]["backup"]:
                     backup = {
                         'parent': True,
                         'parent_ip': parent_address
                     }
 
-                    self.streams[stream_id]["backup"][parent_id] = backup
+                    self.streams[stream_id]["provisions"][root_id]["backup"][parent_id] = backup
 
             else:
                 print(f"Request for parent of {stream_id} was either already satisfied or never existed.")    
@@ -461,6 +436,9 @@ class Node:
 
         else:
             print(f"Unknown message type {msg_type} from {peer_id}.")
+
+
+    #ALL OF THESE ARE JUST FLOOD SPECIFIC!!!
 
     #return True if needs reflooding, False otherwise
     def handle_flood(self, peer_id, stream_id, root_id, tree_version, n_jumps, heuristic): #later on, pass on metrics
@@ -529,6 +507,36 @@ class Node:
             self.streams[stream_id]["provisions"][root_id]["backup"][peer_id] = backup
             return self.choose_best_path(stream_id, root_id)
 
+    def in_emergency(self, stream_id, root_id):
+        if not self.streams[stream_id]["provisions"][root_id]["backup"]:
+            return True
+        return False
+
+    def only_parent(self, stream_id, root_id):
+        if len(self.streams[stream_id]["provisions"][root_id]["backup"]) == 1:
+            return self.streams[stream_id]["provisions"][root_id]["backup"]["parent"]
+        return False
+    
+    async def request_parent(self, stream_id, root_id, peer_id, peer = None):
+        #print(f'Requesting parent for stream {stream_id} from peer {peer_id}.')
+
+        if peer:
+            _, writer = peer
+        else:
+            _, writer = self.peers[peer_id]
+
+        msg_str = f'{REQ_PARENT}{stream_id};{root_id}\n'
+        msg = msg_str.encode('ASCII')
+
+        if (stream_id, root_id) not in self.parent_requests:
+            self.parent_requests.append((stream_id, root_id))
+
+            writer.write(msg)
+            await writer.drain()
+
+    def remove_from_backup(self, peer_id, stream_id, root_id):
+        self.streams[stream_id]["provisions"][root_id]["backup"].pop(peer_id, None)
+
     def choose_best_provision(self, stream_id):
         stream_state = self.streams.get(stream_id, None)
         if not stream_state:
@@ -571,84 +579,22 @@ class Node:
                 "heuristic": best_heuristic
             }
 
-            self.streams[stream_id]["provisions"][root_id]["backup"].pop(best_provider)
+            self.streams[stream_id]["provisions"][root_id]["backup"].pop(best_provider, None)
             self.streams[stream_id]["provisions"][root_id]["best"] = new_best
 
-            self.streams[stream_id]["provisions"][root_id]["backup"][old_best["provider"]] = {
-                "parent": False,
-                "parent_ip": None,
-                "n_jumps": old_best["n_jumps"],
-                "heuristic": old_best["heuristic"]
-            }
+            #only reinsert if it is valid
+            if old_best["heuristic"] != float("inf"):
+                self.streams[stream_id]["provisions"][root_id]["backup"][old_best["provider"]] = {
+                    "parent": False,
+                    "parent_ip": None,
+                    "n_jumps": old_best["n_jumps"],
+                    "heuristic": old_best["heuristic"]
+                }
 
             return True
         
         return False
 
-
-    """ async def flood(self, stream_ids, is_own=False):
-        if not stream_ids:
-            print('EMPTY FLOOD, RETURNING')
-            return
-        streams = {}
-        print(f'Flood called with {stream_ids}')
-
-        #setup !
-        for stream_id in stream_ids:
-            if is_own:
-                best_provision = self.own_streams.get(stream_id, None)
-                if best_provision is None:
-                    print(f'Warning: attempting to flood own {stream_id} that does not exist. Ignoring...')
-                    continue
-
-                heuristic = 0
-                provider = None
-
-                streams[stream_id] = (heuristic, provider)
-
-            else:
-                stream = self.streams.get(stream_id, None)
-                if not stream:
-                    print(f'Warning: attempting to flood {stream_id} that does not exist. Ignoring...')
-
-                best_provision = stream["best"]
-
-                provider = best_provision["provider"]
-                heuristic = best_provision["heuristic"]
-
-                streams[stream_id] = (heuristic, provider)
-
-        for peer_id in self.peers.keys():
-            _, writer = self.peers[peer_id]
-
-            to_flood = 0
-            msg_str = f"{FLOOD_STREAM}"
-
-            for stream_id in streams.keys():
-                heuristic, provider = streams[stream_id]
-                if self.is_server and is_own:
-                    msg_str += f'{stream_id}:{heuristic};'
-                    to_flood += 1
-                elif peer_id != provider and peer_id not in self.streams[stream_id]["backup"].keys(): 
-                    #dont send to backup providers!
-                    msg_str += f'{stream_id}:{heuristic};'
-                    to_flood += 1
-
-            if to_flood == 0:
-                # no streams to be flooded, no work to be done
-                print(f'Flooding nothing to {peer_id}.')
-                continue
-
-
-            msg_str = msg_str[:-1] + '\n'
-            print(f'Sending following message to {peer_id}: {msg_str}', end='')
-
-            msg = msg_str.encode('ASCII')
-
-            writer.write(msg)
-            await writer.drain()
- """
-    
     async def flood(self, items, is_own=False):
         #items is a list of (stream_id, root_provider_id) pairs
         if not items:
@@ -710,8 +656,8 @@ class Node:
 
         items = []
         for stream_id, stream_state in self.streams.items():
-            for root_id in stream_state["providers"].keys():
-                items.append(stream_id, root_id)
+            for root_id in stream_state["provisions"].keys():
+                items.append((stream_id, root_id))
 
         await self.flood(items)
 
@@ -748,83 +694,64 @@ class Node:
             self._async_tasks.append(asyncio.create_task(self.listen_to_peer(peer_id)))
 
     #this version handles death when peer sends a shutdown signal
-    async def handle_death(self, peer_id):
+    async def handle_death(self, peer_id, catastrophy = False):
+        if catastrophy:
+            print(f'Peer {peer_id} has failed catastrophically.')
+
         peer = self.peers.pop(peer_id, None)
         self.latest_heartbeat.pop(peer_id, None)
-        self.peer_addresses.pop(peer_id)
+        self.peer_addresses.pop(peer_id, None)
 
-        if peer:           
-            #step 1 - gather all streams peer provides
-            streams = []
+        if peer:
+            #steps:
+            #1 - gather all streams peer either directly provides or serves as backup.
+            #2 - pop all backups.
+            #3 - remove direct provision and promote best backup
+            
+            # if any of these steps leaves a stream in an emergency state, request parent
+            # if any of these steps had parent backup only, be sure to establish connection.
 
-            for stream_id, stream_info in self.streams.items():
-                if peer_id == stream_info["provider"]:
-                    streams.append(stream_id)
-            
-            #step 2 - delete backups that peer provides
-            for _, dict in self.stream_backups.items():
-                dict.pop(peer_id)
-            
-            #step 3 - choose best backup for each stream
+            for stream_id, stream_state in self.streams.items():
+                for root_id, provision_state in stream_state["provisions"].items():
+                    #three cases:
+                    # 1 - it is a direct provider
+                    # 2 - it is a backup
+                    # 3 - neither
+
+                    #1
+                    if peer_id == provision_state["best"]["provider"]:
+                        #this will force switch between current and best backup
+                        #UNLESS ONLY BACKUP IS PARENT BACKUP
+                        # TODO: CHECK THIS CONDITION!!!!
+                        # if condition is true then do the following
+                        if self.only_parent(stream_id, root_id):
+                            backup = provision_state["backup"]
+                            (parent_id, backup_state), = backup.items()
+                            self.peer_addresses[parent_id] = backup_state["parent_ip"]
+                            self.connect_to_peer(parent_id, backup_state["parent_ip"])
+                        
+                        # after this, the parent node will advertise it's streams, so keeping the heuristic high is still valid
+
+                        # hmmm, how to delete then? keep inf and note that inf means invalid????
+
+                        self.streams[stream_id]["provisions"][root_id]["best"]["heuristic"] = float("inf")
+                        self.choose_best_path(stream_id, root_id)
+
+                    #1 and 2
+                    self.remove_from_backup(peer_id, stream_id, root_id)
+
+                    # here we need to check if stream is left in emergency and ask for parent if so
+                    if self.in_emergency(stream_id, root_id):
+                        current_provider = self.streams[stream_id]["provisions"][root_id]["best"]["provider"]
+                        await self.request_parent(stream_id, root_id, current_provider)
                 
-            #TODO
-            # 1st, check if backup is neighbour node.
-            # 2nd, if not, connect to parent node.
-            # 3rd, new provider for stream is now backup node.
-            for stream_id in streams:
-                backup = self.stream_backups.get(stream_id, None)
-
-                #now, this shouldnt really happen. by this point AT LEAST 1 backup should be in place.
-                if not backup:
-                    self.stream_backups[stream_id] = {}
-
-                    provider = self.streams[stream_id]["provider"]
-                    if provider == peer_id:
-                        await self.request_parent(stream_id, peer_id=peer_id, peer=peer)
-                    else:
-                        await self.request_parent(stream_id, provider)
-
-
-                #choose best backup provider
-                best_heuristic = 1000000 #for now use n_jumps
-                best_provider = None
-                for provider, provider_metrics in backup.items():
-                    n_jumps = provider_metrics["n_jumps"]
-                    if n_jumps < best_heuristic:
-                        best_provider = provider
-                        best_heuristic = n_jumps
-
-                self.streams[stream_id]["provider"] = best_provider
-                self.streams[stream_id]["n_jumps"] = best_heuristic
-
-                self.stream_backups[stream_id].pop(best_provider) #remove from backup
-
-                if not self.stream_backups[stream_id]:
-                    self.stream_backups[stream_id] = {}
-
-                    provider = self.streams[stream_id]["provider"]
-                    if provider == peer_id:
-                        await self.request_parent(peer_id=peer_id, peer=peer)
-                    else:
-                        await self.request_parent(provider)
-
-            #step 4 - trigger flood for altered streams
-
-            await self.flood(streams)
-            
-            
+                self.choose_best_provision(stream_id)
 
             print(f"Closed connection with {peer_id}.")
 
     #this version handles death of catastrophic proportions
     async def catastrophy(self, peer_id):
-        print(f'Peer {peer_id} has died without notifying.')
-        #TODO: handle sudden death 
-        print(f'TODO')
-        self.peers.pop(peer_id)
-        #TODO: REMEMBER TO REMOVE ALL STREAMS THAT IT PROVIDED, ALONG WITH BACKUPS
-        # if backup was parent, establish connection.
-        # if root provider (server crashed) notify that stream is no longer being provided
+        await self.handle_death(peer_id, True)
 
 
 
