@@ -5,6 +5,7 @@ import sys
 import socket
 import argparse
 import json
+import os
 
 from RtpPacket import RtpPacket
 from VideoStream import VideoStream
@@ -32,6 +33,7 @@ FLOOD_STREAM = 'F'
 REQ_STREAM = 'S'
 ANS_STREAM = 'A'
 MSG_METRIC = 'M'
+TEARDOWN = 'T'
 
 
 class Node:
@@ -316,6 +318,42 @@ class Node:
             # não mexemos em UDP aqui; a porta já foi escolhida por quem pediu
             return
 
+        # TEARDOWN: T<stream_id>
+        if msg_type == TEARDOWN:
+            stream_id = msg
+            info = self.streams.get(stream_id)
+            if not info:
+                return
+
+            print(f"[{self.name}] TEARDOWN recebido de {peer_id} para stream {stream_id}")
+
+            # remover este peer das listas de consumidores
+            if peer_id in info.get("consumers", set()):
+                info["consumers"].discard(peer_id)
+            if peer_id in info.get("consumers_udp", {}):
+                info["consumers_udp"].pop(peer_id, None)
+
+            # se, depois disto, este nó também não tiver mais consumidores downstream,
+            # e não for origem nem cliente para esta stream, envia TEARDOWN a montante.
+            if (not info.get("consumers_udp") and
+                stream_id not in self.own_streams and
+                not (self.is_client and self.request_stream_on_join == stream_id)):
+
+                provider = info.get("provider")
+                if provider and provider in self.peers:
+                    _, pr_writer = self.peers[provider]
+                    try:
+                        pr_writer.write((TEARDOWN + stream_id + '\n').encode('ASCII'))
+                        await pr_writer.drain()
+                        info["upstream_udp_port"] = None
+                        self.requested_upstream.discard(stream_id)
+                        print(f"[{self.name}] Reencaminhou TEARDOWN de {stream_id} para provider {provider}")
+                    except Exception as e:
+                        print(f"[{self.name}] Falha ao reencaminhar TEARDOWN para {provider}: {e}")
+
+            return
+
+
     async def _start_upstream_from_provider(self, stream_id: str, provider_id: str):
         """
         Nó intermédio (relay) a pedir stream ao provider:
@@ -439,11 +477,71 @@ class Node:
         await self.flood_all()
         asyncio.create_task(self.listen_to_peer(peer_id))
 
+    def _schedule_teardown_if_leaf(self, stream_id: str):
+            """
+            Agenda (no event loop) uma verificação se este nó é um leaf sem consumidores
+            para o stream_id, e se for o caso envia TEARDOWN ao provider.
+            """
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # não há loop ativo (deve ser durante shutdown), ignorar
+                return
+
+            loop.create_task(self._teardown_if_leaf(stream_id))
+
+    async def _teardown_if_leaf(self, stream_id: str):
+            """
+            Se este nó não tiver consumidores downstream para stream_id,
+            e não for nem origem nem cliente final desse stream,
+            envia TEARDOWN ao provider e limpa estado upstream.
+            """
+            info = self.streams.get(stream_id)
+            if not info:
+                return
+
+            # Se ainda há consumidores downstream, não fazemos nada.
+            if info.get("consumers_udp"):
+                return
+
+            # Se este nó é a ORIGEM da stream, não faz sentido teardown upstream.
+            if stream_id in self.own_streams:
+                return
+
+            # Se este nó é cliente direto desta stream, também não corta upstream.
+            if self.is_client and self.request_stream_on_join == stream_id:
+                return
+
+            provider = info.get("provider")
+            if not provider or provider not in self.peers:
+                return
+
+            _, writer = self.peers[provider]
+
+            try:
+                writer.write((TEARDOWN + stream_id + '\n').encode('ASCII'))
+                await writer.drain()
+                info["upstream_udp_port"] = None
+                self.requested_upstream.discard(stream_id)
+                print(f"[{self.name}] Enviou TEARDOWN de {stream_id} para {provider} (sem consumidores downstream).")
+            except Exception as e:
+                print(f"[{self.name}] Falha ao enviar TEARDOWN para {provider} ({stream_id}): {e}")
+
     # -----------------------
     # Peer removal
     # -----------------------
     def handle_death(self, peer_id):
-        """Remove peer e limpa streams que dependiam dele como provider."""
+        """
+        Remove um peer de:
+          - tabela de peers (TCP),
+          - heartbeats,
+          - streams onde era provider,
+          - streams onde era consumidor (consumers / consumers_udp).
+
+        Se, após remover o peer, algum stream ficar sem consumidores downstream
+        neste nó, agenda TEARDOWN para o provider desse stream.
+        """
+        # remover da tabela de peers e fechar ligação TCP
         peer = self.peers.pop(peer_id, None)
         try:
             self.latest_heartbeat.pop(peer_id, None)
@@ -456,13 +554,44 @@ class Node:
             except:
                 pass
 
-        removed = []
+        removed_provided = 0
+        changed_sids = set()
+
+        # varrer todos os streams conhecidos neste nó
         for sid, info in list(self.streams.items()):
+            # 1) Se este peer era o provider deste stream, removemos o stream todo
             if info.get("provider") == peer_id:
-                removed.append(sid)
-        for sid in removed:
-            self.streams.pop(sid, None)
-        print(f"[{self.name}] Closed connection with {peer_id} and removed {len(removed)} streams.")
+                self.streams.pop(sid, None)
+                removed_provided += 1
+                continue  # próximo stream
+
+            # 2) Se este peer era consumidor downstream, removê-lo das estruturas
+            before_cons = len(info.get("consumers", set()))
+            before_udp  = len(info.get("consumers_udp", {}))
+
+            if peer_id in info.get("consumers", set()):
+                info["consumers"].discard(peer_id)
+            if peer_id in info.get("consumers_udp", {}):
+                info["consumers_udp"].pop(peer_id, None)
+
+            after_cons = len(info.get("consumers", set()))
+            after_udp  = len(info.get("consumers_udp", {}))
+
+            # se houve alteração como consumidor, marcamos este stream
+            if (before_cons != after_cons) or (before_udp != after_udp):
+                changed_sids.add(sid)
+
+        # Para todos os streams onde houve alteração, verificar se este nó ficou leaf
+        for sid in changed_sids:
+            self._schedule_teardown_if_leaf(sid)
+
+        print(
+            f"[{self.name}] Closed connection with {peer_id}. "
+            f"Streams removidos como provider: {removed_provided}, "
+            f"streams alterados como consumer: {len(changed_sids)}."
+        )
+
+
 
     # -----------------------
     # Manifest loader (server)
@@ -562,22 +691,26 @@ class Node:
 
                 # cliente: grava frame
                 if self.is_client:
-                    filename = f"cache-{seq}.jpg"
+                    # diretório base: cache/<nome_do_nó>/<stream_id>/
+                    base_dir = os.path.join("cache", self.name, stream_id)
+                    os.makedirs(base_dir, exist_ok=True)
+
+                    filename = os.path.join(base_dir, f"cache-{seq}.jpg")
                     try:
                         with open(filename, "wb") as f:
                             f.write(payload)
                     except Exception as e:
                         print(f"[{self.name}] Erro ao gravar frame {filename}: {e}")
 
-                    # Limpeza automática de frames antigas (buffer circular de 1000 frames)
-                    import os
-                    old_seq = (seq - 1000) & 0xFFFF
-                    old_file = f"cache-{old_seq}.jpg"
+                    # Limpeza automática de frames antigas (buffer circular de 500 frames)
+                    old_seq = (seq - 500) & 0xFFFF
+                    old_file = os.path.join(base_dir, f"cache-{old_seq}.jpg")
                     try:
                         if os.path.exists(old_file):
                             os.remove(old_file)
                     except Exception as e:
                         print(f"[{self.name}] Erro ao apagar {old_file}: {e}")
+
 
 
         finally:
@@ -603,37 +736,60 @@ class Node:
 
             print(f"[{self.name}] receive_stream({stream_id}) terminou.")
 
+
     async def stream_local_origin_to_consumers(self, stream_id):
         """
         Servidor de origem:
         - Usa VideoStream(movie.Mjpeg) tal como no ZIP.
         - Envia as frames em RTP.
-        - Quando chega ao fim do vídeo, recomeça do início (loop infinito).
+        - Faz loop do vídeo ENQUANTO houver pelo menos um consumidor downstream.
+        - Se deixar de haver consumidores (por teardown, morte de clientes, etc.),
+          pára o streaming para esse stream_id.
         """
         meta = self.own_streams.get(stream_id, {})
         filename = meta.get("file", "movie.Mjpeg")
 
         udp_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         seq = 0
-        ssrc = 12345
+        ssrc = 12345  # arbitrary
 
-        print(f"[{self.name}] Origin streaming {stream_id} em loop a partir de '{filename}'...")
+        print(f"[{self.name}] Origin streaming {stream_id} a partir de '{filename}' (loop enquanto houver consumidores).")
 
         try:
-            while True:  # loop infinito de vídeo
+            while True:
+                # 1) Antes de começar (ou recomeçar) o vídeo, verificar se ainda há consumidores
+                info = self.streams.get(stream_id)
+                if not info or not info.get("consumers_udp"):
+                    print(f"[{self.name}] Origin: stream {stream_id} sem consumidores -> parar streaming.")
+                    break
+
+                # 2) Abrir um novo VideoStream para uma passagem completa do ficheiro
                 try:
                     vs = VideoStream(filename)
                 except Exception as e:
                     print(f"[{self.name}] Falha ao abrir VideoStream('{filename}'): {e}")
-                    return
+                    break
+
+                print(f"[{self.name}] Origin: início de nova passagem do vídeo '{filename}' para stream {stream_id}.")
 
                 while True:
                     frame = vs.nextFrame()
                     if not frame:
-                        # fim do ficheiro -> sai do ciclo interno e reabre o VideoStream
-                        print(f"[{self.name}] Fim do vídeo '{filename}' para stream {stream_id}, a recomeçar...")
+                        # fim do ficheiro -> sair deste ciclo interno
+                        print(f"[{self.name}] Fim do vídeo '{filename}' para stream {stream_id}.")
                         break
 
+                    # atualizar info (consumers podem mudar a meio)
+                    info = self.streams.get(stream_id)
+                    consumers_udp = info.get("consumers_udp", {}) if info else {}
+
+                    # Se entretanto os consumidores desapareceram, paramos no fim desta passagem
+                    if not consumers_udp:
+                        print(f"[{self.name}] Origin: consumidores desapareceram a meio da passagem de {stream_id}; "
+                              f"não há mais envios para esta stream.")
+                        break
+
+                    # Empacotar frame em RTP
                     pkt = RtpPacket()
                     pkt.encode(
                         version=2,
@@ -648,20 +804,21 @@ class Node:
                     )
                     data = pkt.getPacket()
 
-                    consumers_udp = self.streams.get(stream_id, {}).get("consumers_udp", {})
-
+                    # Enviar para todos os consumers atuais
                     for peer_id, (cip, cport) in list(consumers_udp.items()):
                         try:
                             udp_send_sock.sendto(data, (cip, cport))
+                            # podes deixar o print comentado se for demasiado spammy
                             # print(f"[SERVER {self.name}] Enviado frame seq={seq} para {peer_id} @ {cip}:{cport}")
                         except Exception as e:
-                            print(f"[{self.name}] Falha ao enviar frame seq={seq} para {peer_id}: {e}")
+                            print(f"[SERVER {self.name}] Falha ao enviar frame seq={seq} para {peer_id}: {e}")
 
                     seq = (seq + 1) & 0xFFFF
                     await asyncio.sleep(1/25)
 
-                # aqui o ciclo interno terminou -> volta ao while True externo,
-                # que volta a criar um novo VideoStream e recomeça o vídeo
+                # Aqui terminou UMA passagem pelo ficheiro.
+                # O while True externo decide se volta a recomeçar ou termina.
+                # Se não houver consumidores, o próximo ciclo externo faz break logo no início.
 
         finally:
             try:
@@ -669,6 +826,7 @@ class Node:
             except:
                 pass
             print(f"[{self.name}] Origin streaming {stream_id} terminado.")
+
 
 
     # -----------------------
@@ -730,6 +888,7 @@ class Node:
                 udp_sock.close()
             except:
                 pass
+
 
     async def start(self):
         """Bootstrap -> TCP server -> connect_to_peers -> tarefas de fundo."""

@@ -14,16 +14,23 @@
             }
         },
         "router2": {
-            "addresses": ["10.0.1.2", "10.0.2.1"],
+            "addresses": ["10.0.1.2", "10.0.2.1", "10.0.3.1"],
             "neighbours": {
                 "router": "10.0.1.1",
-                "client": "10.0.2.20"
+                "client": "10.0.2.20",
+                "client2": "10.0.3.20"
             }
         },
         "client": {
             "addresses": ["10.0.2.20"],
             "neighbours": {
                 "router2": "10.0.2.1"
+            }
+        },
+        "client2": {
+            "addresses": ["10.0.3.20"],
+            "neighbours": {
+                "router2": "10.0.3.1"
             }
         }
     }
