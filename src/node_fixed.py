@@ -16,8 +16,8 @@ UDP_PORT = UDP_PORT_START
 BOOTSTRAP_ADDR = '10.0.9.10' # placeholder, should always be passed as argument
 BOOTSTRAP_PORT = 4321 #can be anything
 
-HEARTBEAT_INTERVAL = 0.333
-HEARTBEAT_TIMEOUT  = HEARTBEAT_INTERVAL * 3
+HEARTBEAT_INTERVAL = 0.25
+HEARTBEAT_TIMEOUT  = HEARTBEAT_INTERVAL * 5
 
 # Message definitions and stuff 
 
@@ -105,7 +105,7 @@ class Node:
         #       }
         #   }
         #}
-
+        self.listen_tasks = {} # peer_id -> task
 
         self.latest_heartbeat = {} # str (node_id) -> float? (last time heartbeat was received)
 
@@ -180,11 +180,10 @@ class Node:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
             # Iterate over a snapshot to avoid concurrent mutation issues
-            for peer_id, (_, writer) in list(self.peers.items()):
+            for peer_id, (reader, writer) in list(self.peers.items()):
                 try:
-                    #print(f'attempting heartbeat to {peer_id}')
-                    msg = MSG_HEARTBEAT + '\n'
-                    writer.write(msg.encode('ASCII'))
+                    print(f'attempting heartbeat to {peer_id} with reader {id(reader)}')
+                    writer.write(f'{MSG_HEARTBEAT}\n'.encode('ASCII'))
                     await writer.drain()
                 except Exception:
                     continue
@@ -194,7 +193,7 @@ class Node:
             await asyncio.sleep(1)  # arbitrary; tune later
             now = time.time()
 
-            # Iterate over a snapshot to avoid "dict changed size during iteration"
+            # iterate over a snapshot to avoid "dict changed size during iteration"
             for peer_id, last in list(self.latest_heartbeat.items()):
                 if now - last > HEARTBEAT_TIMEOUT:
                     await self.catastrophy(peer_id)
@@ -291,40 +290,35 @@ class Node:
 
         for peer_id, (reader, writer) in peers.items():
             self.peers[peer_id] = (reader, writer)
-            asyncio.create_task(self.listen_to_peer(peer_id))
+            self.listen_tasks[peer_id] = asyncio.create_task(self.listen_to_peer(peer_id))
 
         if successes > 0:       
             await self.flood_all()
 
+
     async def listen_to_peer(self, peer_id):
-        #print(f'listening to {peer_id}')
         reader, _ = self.peers[peer_id]
+        print(f'listening to {peer_id} with reader {id(reader)}')
         try:
             while True:
                 #print(f'wait for read {peer_id}')
-                data = await reader.readline()
-                if not data:
-                    break
-
-                msg = data.decode('ASCII').strip(' \n')
-
-                await self.process_request(peer_id, msg)
-
+                
+                    data = await reader.readline()
+                    if not data:
+                        break
+                    msg = data.decode('ASCII').strip(' \n')
+                    await self.process_request(peer_id, msg)
         except Exception as e:
             print(e)
+            return #maybe continue if dont want to kill process
         finally:
             #DO NOT DECLARE AS CATASTROPHY WHEN CHANNEL CLOSES, ONLY RETURN THE PROCESS
             #await self.catastrophy(peer_id)
+            print(f'no longer listening to {peer_id}')
             return
 
     async def process_request(self, peer_id, message):
-        """
-        Handle one control-plane message received from a neighbour.
-
-        IMPORTANT:
-        - Keep this handler side-effect safe: any time we send MSG_ERROR, return immediately.
-        - Avoid raising in protocol-handling paths; failures should be contained.
-        """
+        
         # peer might already have been removed by a concurrent failure path
         peer = self.peers.get(peer_id)
         if not peer:
@@ -335,11 +329,13 @@ class Node:
         msg_type = message[0]
         msg = '' if len(message) == 1 else message[1:]
         
-        if msg_type != MSG_HEARTBEAT:
-            print(f'From {peer_id}: [{msg_type}] {msg}')
+
+        #if msg_type != MSG_HEARTBEAT:
+        print(f'From {peer_id}: [{msg_type}] {msg}')
 
         if msg_type == MSG_HEARTBEAT:
             self.latest_heartbeat[peer_id] = time.time()
+            return
 
         elif msg_type == REQ_STREAM:
             # A neighbour is asking us to provide/forward a stream.
@@ -364,23 +360,19 @@ class Node:
 
         elif msg_type == UNPROVIDE_STREAM:
             # A neighbour indicates it will stop providing a stream (best effort handling).
-            stream_id = msg.strip()
-            if not stream_id:
-                writer.write(f'{MSG_ERROR}UNPROVIDE_STREAM missing stream_id.\n'.encode('ASCII'))
-                await writer.drain()
-                return
-            print(f"Stream {stream_id} unprovided by {peer_id}.")
-            # If we have state for this stream, invalidate any paths that use this provider.
-            stream_state = self.streams.get(stream_id)
-            if stream_state:
-                for root_id, provision_state in stream_state.get("provisions", {}).items():
-                    if provision_state.get("best", {}).get("provider") == peer_id:
-                        provision_state["best"]["heuristic"] = float("inf")
-                        self.choose_best_path(stream_id, root_id)
-                        self.choose_best_provision(stream_id)
-                    else:
-                        # may be in backup set
-                        self.remove_from_backup(peer_id, stream_id, root_id)
+            provisions = msg.split(';')
+            unprovided = []
+
+            for provision in provisions:
+                provision_fields = provision.split(',')
+                stream_id = provision_fields[0]
+                root_id = provision_fields[1]
+
+                #TODO: LOGIC
+                #if completely out of options, signal unprovide onwards
+
+
+            await self.unprovide(unprovided)
 
         elif msg_type == UNREQ_STREAM:
             # A neighbour no longer wants a stream from us.
@@ -420,7 +412,7 @@ class Node:
                 if changed:
                     altered_streams.append((stream_id, root_provider))
 
-                if self.in_emergency(stream_id, root_provider):
+                if self.in_emergency(stream_id, root_provider) and not self.is_root(stream_id, root_provider):
                     await self.request_parent(stream_id, root_provider, peer_id)
 
             # Reflood only what changed
@@ -525,6 +517,9 @@ class Node:
         else:
             print(f"Unknown message type {msg_type} from {peer_id}.")
 
+
+
+
     async def handle_flood(self, peer_id, stream_id, root_id, parent_id, tree_version, n_jumps, heuristic, link_cost): #later on, pass on metrics
         stream_state = self.streams.get(stream_id, None)
         if not stream_state:
@@ -569,7 +564,9 @@ class Node:
              
         if provision_state["best"]["provider"] == peer_id:
             #best is already peer, update stuff and reflood
-            best = {
+            old_best = self.streams[stream_id]["provisions"][root_id]["best"]
+
+            new_best = {
                 "provider": peer_id,
                 "grand_parent": parent_id,
                 "n_jumps": n_jumps,
@@ -577,10 +574,18 @@ class Node:
                 #metrics: { ... }
             }
 
-            self.streams[stream_id]["provisions"][root_id]["best"] = best
+            self.streams[stream_id]["provisions"][root_id]["best"] = new_best
             
+            if old_best["grand_parent"] != new_best["grand_parent"]:
+                if self.pop_parent_request(stream_id, root_id) and not self.is_root(stream_id, root_id):
+                    await self.request_parent(stream_id, root_id, peer_id)
+                
+
             #TODO: Only trigger reflood in case of drastic change when I have metrics
+            #if change is greater than threshold, return true, else return whatever choose_best_path tells you
             return_value = True
+            self.choose_best_path(stream_id, root_id)
+            self.choose_best_provision(stream_id)
         
         else:
             #best isnt peer.
@@ -592,6 +597,12 @@ class Node:
                 "heuristic": heuristic + link_cost
                 #metrics: { ... }
             }
+
+            old_backup = self.streams[stream_id]["provisions"][root_id]["backup"].get(peer_id, None)
+            if old_backup and not old_backup["parent"]:     
+                if old_backup["grand_parent"] != backup["grand_parent"]:
+                    if self.pop_parent_request(stream_id, root_id) and not self.is_root(stream_id, root_id):
+                        await self.request_parent(stream_id, root_id, peer_id)
 
             self.streams[stream_id]["provisions"][root_id]["backup"][peer_id] = backup
             return_value = self.choose_best_path(stream_id, root_id)
@@ -611,12 +622,12 @@ class Node:
                     self.pop_parent_request(stream_id, root_id)
                 
                 elif heuristic < provision_state["best"]["heuristic"]:
-                    if self.only_has_grandparent(stream_id, root_id, parent_id):
+                    if self.only_has_grandparent(stream_id, root_id, parent_id) and not self.is_root(stream_id, root_id):
                         await self.request_parent(stream_id, root_id, parent_id)
                         
                 else:
                     if self.name < peer_id:
-                        if self.only_has_grandparent(stream_id, root_id, parent_id):
+                        if self.only_has_grandparent(stream_id, root_id, parent_id) and not self.is_root(stream_id, root_id):
                             await self.request_parent(stream_id, root_id, parent_id)
                             
             else:
@@ -625,15 +636,16 @@ class Node:
                     self.pop_parent_request(stream_id, root_id)
                 
                 elif heuristic < backup["heuristic"]:
-                    if self.only_has_grandparent(stream_id, root_id, parent_id):
+                    if self.only_has_grandparent(stream_id, root_id, parent_id) and not self.is_root(stream_id, root_id):
                         await self.request_parent(stream_id, root_id, parent_id)
                         
                 else:
                     if self.name < peer_id:
-                        if self.only_has_grandparent(stream_id, root_id, parent_id):
+                        if self.only_has_grandparent(stream_id, root_id, parent_id) and not self.is_root(stream_id, root_id):
                             await self.request_parent(stream_id, root_id, parent_id)        
     
         return return_value
+
 
     def in_emergency(self, stream_id, root_id):
         if not self.streams[stream_id]["provisions"][root_id]["backup"]:
@@ -645,7 +657,18 @@ class Node:
             (provider_id, backup_state), = self.streams[stream_id]["provisions"][root_id]["backup"].items()
             return self.streams[stream_id]["provisions"][root_id]["backup"][provider_id]["parent"]
         return False
-    
+
+    def is_root(self, stream_id, root_id):
+        stream_state = self.streams.get(stream_id, None)
+        if not stream_state:
+            return False
+        
+        provision_state = stream_state["provisions"].get(root_id, None)
+        if not provision_state:
+            return False
+        
+        return root_id == provision_state["best"]["provider"]
+
     async def request_parent(self, stream_id, root_id, peer_id, peer = None):
         #print(f'Requesting parent for stream {stream_id} from peer {peer_id}.')
 
@@ -669,11 +692,11 @@ class Node:
     def pop_parent_request(self, stream_id, root_id):
         stream_state = self.streams.get(stream_id, None)
         if not stream_state:
-            return
+            return False
         
         provision_state = stream_state["provisions"].get(root_id, None)
         if not provision_state:
-            return
+            return False
         
         parent_backup = ""
         for provider, backup_state in provision_state["backup"].items():
@@ -682,7 +705,13 @@ class Node:
                 break
             
         if parent_backup:
-            self.streams[stream_id]["provisions"][root_id]["backup"].pop(parent_backup, None)
+            if self.streams[stream_id]["provisions"][root_id]["backup"].pop(parent_backup, None):
+                return True
+            else:
+                return False
+            
+        return False
+
 
     def only_has_grandparent(self, stream_id, root_id, grandparent_id):
         stream_state = self.streams.get(stream_id, None)
@@ -764,6 +793,9 @@ class Node:
         
         return False
 
+
+
+
     async def flood(self, items, is_own=False):
         #items is a list of (stream_id, root_provider_id) pairs
         if not items:
@@ -836,6 +868,20 @@ class Node:
 
         await self.flood(items)
 
+    async def unprovide(self, items):
+        msg = f'{UNPROVIDE_STREAM}'
+
+        for stream_id, root_id in items:
+            msg += f'{stream_id}:{root_id};'
+        msg = msg[:-1] + '\n'
+
+        for _, (_, writer) in self.peers.items():
+            try:
+                writer.write(msg.encode('ASCII'))
+                await writer.drain()
+            except:
+                continue
+
 
 
     async def handle_connection(self, reader, writer):
@@ -866,7 +912,7 @@ class Node:
             
             await self.flood_all()
 
-            self._async_tasks.append(asyncio.create_task(self.listen_to_peer(peer_id)))
+            self.listen_tasks[peer_id] = asyncio.create_task(self.listen_to_peer(peer_id))
 
     #this version handles death when peer sends a shutdown signal
     async def handle_death(self, peer_id, catastrophy = False):
@@ -886,8 +932,14 @@ class Node:
             # if any of these steps leaves a stream in an emergency state, request parent
             # if any of these steps had parent backup only, be sure to establish connection.
 
+            unprovided = []
+
             for stream_id, stream_state in self.streams.items():
                 for root_id, provision_state in stream_state["provisions"].items():
+
+                    #yield cpu here
+                    await asyncio.sleep(0)
+
                     #three cases:
                     # 1 - it is a direct provider
                     # 2 - it is a backup
@@ -899,6 +951,12 @@ class Node:
                         #UNLESS ONLY BACKUP IS PARENT BACKUP
                         # TODO: CHECK THIS CONDITION!!!!
                         # if condition is true then do the following
+                        if self.is_root(stream_id, root_id):
+                            backup = provision_state["backup"]
+                            if not backup:
+                                unprovided.append((stream_id, root_id))
+                                continue
+
                         if self.only_parent(stream_id, root_id):
                             backup = provision_state["backup"]
                             (parent_id, backup_state), = backup.items()
@@ -914,30 +972,47 @@ class Node:
                                 print(f'Attempting to connect to {parent_id}:{backup_state["parent_ip"]}')
                                 reader, writer = await self.connect_to_peer(parent_id, backup_state["parent_ip"])
                                 self.peers[parent_id] = (reader, writer)
-                                asyncio.create_task(self.listen_to_peer(parent_id))
+                                self.listen_tasks[parent_id] = asyncio.create_task(self.listen_to_peer(parent_id))
                         
                         # after this, the parent node will advertise it's streams, so keeping the heuristic high is still valid
 
                         # hmmm, how to delete then? keep inf and note that inf means invalid????
 
                         self.streams[stream_id]["provisions"][root_id]["best"]["heuristic"] = float("inf")
+
+
+
                         self.choose_best_path(stream_id, root_id)
                         self.choose_best_provision(stream_id)
+
+                        
 
                     #1 and 2
                     self.remove_from_backup(peer_id, stream_id, root_id)
 
                     # here we need to check if stream is left in emergency and ask for parent if so
-                    if self.in_emergency(stream_id, root_id):
+                    if self.in_emergency(stream_id, root_id) and not self.is_root(stream_id, root_id):
                         current_provider = self.streams[stream_id]["provisions"][root_id]["best"]["provider"]
                         await self.request_parent(stream_id, root_id, current_provider)
                 
                 self.choose_best_provision(stream_id)
 
+            #await self.unprovide(unprovided)
+
+            _, writer = peer
+            writer.close()
+            await writer.wait_closed()
+
+            task = self.listen_tasks.get(peer_id, None)
+            if task:
+                task.cancel()
+
             print(f"Closed connection with {peer_id}.")
 
     #this version handles death of catastrophic proportions
     async def catastrophy(self, peer_id):
+        # yeah, the logic is the same, so just
+        # call the other one
         await self.handle_death(peer_id, True)
 
 
@@ -1011,14 +1086,20 @@ class Node:
                 writer.close()
                 await writer.wait_closed()
             except Exception:
-                pass
+                continue
 
         # Cancel background tasks (listener loops, heartbeat loops, etc.)
-        for t in getattr(self, "_async_tasks", []):
+        for t in self._async_tasks:
             try:
                 t.cancel()
             except Exception:
-                pass
+                continue
+
+        for _, task in self.listen_tasks.items():
+            try:
+                task.cancel()
+            except:
+                continue
 
         print(' done!')
 
