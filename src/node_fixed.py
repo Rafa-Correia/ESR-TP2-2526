@@ -182,7 +182,7 @@ class Node:
             # Iterate over a snapshot to avoid concurrent mutation issues
             for peer_id, (reader, writer) in list(self.peers.items()):
                 try:
-                    print(f'attempting heartbeat to {peer_id} with reader {id(reader)}')
+                    #print(f'attempting heartbeat to {peer_id} with reader {id(reader)}')
                     writer.write(f'{MSG_HEARTBEAT}\n'.encode('ASCII'))
                     await writer.drain()
                 except Exception:
@@ -307,6 +307,8 @@ class Node:
                     if not data:
                         break
                     msg = data.decode('ASCII').strip(' \n')
+                    if not msg:
+                        continue
                     await self.process_request(peer_id, msg)
         except Exception as e:
             print(e)
@@ -330,8 +332,8 @@ class Node:
         msg = '' if len(message) == 1 else message[1:]
         
 
-        #if msg_type != MSG_HEARTBEAT:
-        print(f'From {peer_id}: [{msg_type}] {msg}')
+        if msg_type != MSG_HEARTBEAT:
+            print(f'From {peer_id}: [{msg_type}] {msg}')
 
         if msg_type == MSG_HEARTBEAT:
             self.latest_heartbeat[peer_id] = time.time()
@@ -362,6 +364,7 @@ class Node:
             # A neighbour indicates it will stop providing a stream (best effort handling).
             provisions = msg.split(';')
             unprovided = []
+            changed = []
 
             for provision in provisions:
                 provision_fields = provision.split(',')
@@ -370,9 +373,52 @@ class Node:
 
                 #TODO: LOGIC
                 #if completely out of options, signal unprovide onwards
+                stream_state = self.streams.get(stream_id, None)
+                if not stream_state:
+                    continue
+                
+                provision_state = stream_state["provsions"].get(root_id, None)
+                if not provision_state:
+                    continue
+                
+                if peer_id in provision_state["backup"].keys():
+                    self.remove_from_backup(peer_id, stream_id, root_id)
+                    if self.in_emergency(stream_id, root_id):
+                        await self.request_parent(stream_id, root_id, provision_state["best"]["provider"])
+                        
+                if peer_id == provision_state["best"]["provider"]:
+                    if not provision_state["backup"]:
+                        self.streams[stream_id]["provisions"].pop(root_id)
+                        unprovided.append((stream_id, root_id))
+                        
+                    elif self.only_parent(stream_id, root_id):
+                        (parent_id, backup_state), = provision_state["backup"].items()
+                        if parent_id not in self.peer_addresses.keys():
+                            self.peer_addresses[parent_id] = backup_state["parent_ip"]
+                        if parent_id not in self.peers.keys():
+                            print(f'Attempting to connect to {parent_id}:{backup_state["parent_ip"]}')
+                            res = await self.connect_to_peer(parent_id, backup_state["parent_ip"])
+                            if res == 1 or res == 2:
+                                self.peer_addresses.pop(parent_id, None)
+                                self.streams[stream_id]["provisions"].pop(root_id, None)
+                                if not self.streams[stream_id]["provisions"]:
+                                    self.streams.pop(stream_id, None)
+                                unprovided.append(stream_id, root_id)
+                            else:
+                                reader, writer = res
+                                self.peers[parent_id] = (reader, writer)
+                                self.listen_tasks[parent_id] = asyncio.create_task(self.listen_to_peer(parent_id))
+                        
+                    else:
+                        self.streams[stream_id]["provisions"][root_id]["best"]["heuristic"] = float("inf")
+                        self.choose_best_path(stream_id, root_id)
+                        self.choose_best_provision(stream_id)
+                        
+                        changed.append((stream_id, root_id))
 
 
             await self.unprovide(unprovided)
+            await self.flood(changed)
 
         elif msg_type == UNREQ_STREAM:
             # A neighbour no longer wants a stream from us.
@@ -521,6 +567,9 @@ class Node:
 
 
     async def handle_flood(self, peer_id, stream_id, root_id, parent_id, tree_version, n_jumps, heuristic, link_cost): #later on, pass on metrics
+        print(f'HANDLE_FLOOD called with {peer_id}, {stream_id}, {root_id}, {parent_id}, {tree_version}, {n_jumps}, {heuristic}, {link_cost}')
+        if root_id == self.name:
+            return False
         stream_state = self.streams.get(stream_id, None)
         if not stream_state:
             #stream itself doesnt have registry
@@ -648,6 +697,8 @@ class Node:
 
 
     def in_emergency(self, stream_id, root_id):
+        if root_id == self.name:
+            return False
         if not self.streams[stream_id]["provisions"][root_id]["backup"]:
             return True
         return False
@@ -970,9 +1021,17 @@ class Node:
                                 self.peer_addresses[parent_id] = backup_state["parent_ip"]
                             if parent_id not in self.peers.keys():
                                 print(f'Attempting to connect to {parent_id}:{backup_state["parent_ip"]}')
-                                reader, writer = await self.connect_to_peer(parent_id, backup_state["parent_ip"])
-                                self.peers[parent_id] = (reader, writer)
-                                self.listen_tasks[parent_id] = asyncio.create_task(self.listen_to_peer(parent_id))
+                                res = await self.connect_to_peer(parent_id, backup_state["parent_ip"])
+                                if res == 1 or res == 2:
+                                    self.peer_addresses.pop(parent_id, None)
+                                    self.streams[stream_id]["provisions"].pop(root_id, None)
+                                    if not self.streams[stream_id]["provisions"]:
+                                        self.streams.pop(stream_id, None)
+                                    unprovided.append((stream_id, root_id))
+                                else:
+                                    reader, writer = res
+                                    self.peers[parent_id] = (reader, writer)
+                                    self.listen_tasks[parent_id] = asyncio.create_task(self.listen_to_peer(parent_id))
                         
                         # after this, the parent node will advertise it's streams, so keeping the heuristic high is still valid
 
@@ -997,7 +1056,7 @@ class Node:
                 
                 self.choose_best_provision(stream_id)
 
-            #await self.unprovide(unprovided)
+            await self.unprovide(unprovided)
 
             _, writer = peer
             writer.close()
